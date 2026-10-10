@@ -24,6 +24,39 @@ pub enum Shape {
 /// Lights go on keys 4-6 and dials 0-2.
 pub const MAX_LIGHTS: usize = 3;
 
+/// Presets fill all eight keys when the picker is up.
+pub const MAX_PRESETS: usize = 8;
+
+/// Everything in lights.conf.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Config {
+    pub lights: Vec<LightConfig>,
+    pub presets: Vec<Preset>,
+}
+
+/// A named arrangement of the lights, recalled with one key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preset {
+    pub name: String,
+    /// By light name. A light not listed is left as it is.
+    pub settings: Vec<(String, Setting)>,
+}
+
+impl Preset {
+    pub fn setting(&self, light: &str) -> Option<Setting> {
+        self.settings.iter().find(|(name, _)| name == light).map(|(_, setting)| *setting)
+    }
+}
+
+/// What a preset does to one light. Brightness or temperature left as None
+/// keeps whatever the light has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Setting {
+    pub on: bool,
+    pub brightness: Option<i32>,
+    pub temperature: Option<i32>,
+}
+
 /// Every Key Light serves its control API on this port.
 pub const PORT: u16 = 9123;
 
@@ -67,11 +100,11 @@ pub fn default_path() -> Option<PathBuf> {
     Some(base.join("decker").join("lights.conf"))
 }
 
-pub fn load(path: &Path) -> Result<Vec<LightConfig>, Box<dyn Error>> {
+pub fn load(path: &Path) -> Result<Config, Box<dyn Error>> {
     let text = std::fs::read_to_string(path)
         .map_err(|problem| format!("cannot read {}: {}", path.display(), problem))?;
-    let lights = parse(&text).map_err(|problem| format!("{}: {}", path.display(), problem))?;
-    Ok(lights)
+    let config = parse(&text).map_err(|problem| format!("{}: {}", path.display(), problem))?;
+    Ok(config)
 }
 
 /// One `[Name]` section per light, left to right:
@@ -83,9 +116,20 @@ pub fn load(path: &Path) -> Result<Vec<LightConfig>, Box<dyn Error>> {
 /// shape = panel
 /// ```
 ///
+/// and up to eight `[preset Name]` sections, each setting lights by name:
+///
+/// ```text
+/// [preset Soft]
+/// Key = 14% 344
+/// Air = on 3200K
+/// MK.2 = off
+/// ```
+///
 /// Blank lines and lines starting with `#` or `;` are ignored.
-pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
+pub fn parse(text: &str) -> Result<Config, String> {
     let mut sections: Vec<Section> = Vec::new();
+    let mut presets: Vec<PresetSection> = Vec::new();
+    let mut in_preset = false;
 
     for (number, line) in text.lines().enumerate() {
         let number = number + 1;
@@ -99,6 +143,22 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
                 .strip_suffix(']')
                 .ok_or_else(|| format!("line {}: section header is missing its ]", number))?
                 .trim();
+            let preset = name
+                .strip_prefix("preset")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+            if let Some(preset) = preset {
+                let preset = preset.trim();
+                if preset.is_empty() {
+                    return Err(format!("line {}: preset has no name", number));
+                }
+                if presets.iter().any(|section| section.name == preset) {
+                    return Err(format!("line {}: [preset {}] appears twice", number, preset));
+                }
+                presets.push(PresetSection { name: preset.to_string(), line: number, settings: Vec::new() });
+                in_preset = true;
+                continue;
+            }
+
             if name.is_empty() {
                 return Err(format!("line {}: light has no name", number));
             }
@@ -106,6 +166,7 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
                 return Err(format!("line {}: [{}] appears twice", number, name));
             }
             sections.push(Section { name: name.to_string(), line: number, id: None, host: None, shape: None });
+            in_preset = false;
             continue;
         }
 
@@ -116,6 +177,16 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
 
         if value.is_empty() {
             return Err(format!("line {}: {} has no value", number, key));
+        }
+
+        if in_preset {
+            let preset = presets.last_mut().expect("in_preset follows a preset header");
+            if preset.settings.iter().any(|(light, _, _)| light == key) {
+                return Err(format!("line {}: {} given twice", number, key));
+            }
+            let setting = setting(value).map_err(|problem| format!("line {}: {}: {}", number, key, problem))?;
+            preset.settings.push((key.to_string(), setting, number));
+            continue;
         }
 
         let section = sections
@@ -147,7 +218,85 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
     if sections.len() > MAX_LIGHTS {
         return Err(format!("{} lights configured, but there is only room for {}", sections.len(), MAX_LIGHTS));
     }
-    sections.into_iter().map(Section::finish).collect()
+    if presets.len() > MAX_PRESETS {
+        return Err(format!("{} presets configured, but there is only room for {}", presets.len(), MAX_PRESETS));
+    }
+
+    let mut finished = Vec::new();
+    for preset in presets {
+        if preset.settings.is_empty() {
+            return Err(format!("line {}: [preset {}] sets no lights", preset.line, preset.name));
+        }
+        for (light, _, line) in &preset.settings {
+            if !sections.iter().any(|section| &section.name == light) {
+                return Err(format!("line {}: {} is not one of the lights", line, light));
+            }
+        }
+        finished.push(Preset {
+            name: preset.name,
+            settings: preset.settings.into_iter().map(|(light, setting, _)| (light, setting)).collect(),
+        });
+    }
+
+    let lights = sections.into_iter().map(Section::finish).collect::<Result<_, _>>()?;
+    Ok(Config { lights, presets: finished })
+}
+
+struct PresetSection {
+    name: String,
+    line: usize,
+    settings: Vec<(String, Setting, usize)>,
+}
+
+/// `off`, or `on` and/or a brightness like `40%` and a temperature, either in
+/// mireds like the Elgato API (`213`) or in Kelvin (`4700K`).
+fn setting(value: &str) -> Result<Setting, String> {
+    let words: Vec<&str> = value.split_whitespace().collect();
+    if words.contains(&"off") {
+        if words.len() > 1 {
+            return Err("off takes nothing else".into());
+        }
+        return Ok(Setting { on: false, brightness: None, temperature: None });
+    }
+
+    let mut setting = Setting { on: true, brightness: None, temperature: None };
+    for word in words {
+        if word == "on" {
+            continue;
+        }
+
+        if let Some(number) = word.strip_suffix('%') {
+            let brightness: i32 = number.parse().map_err(|_| format!("{} is not a brightness", word))?;
+            if !(BRIGHTNESS_MIN..=BRIGHTNESS_MAX).contains(&brightness) {
+                return Err(format!("brightness {} is outside 0-100%", word));
+            }
+            if setting.brightness.replace(brightness).is_some() {
+                return Err("brightness given twice".into());
+            }
+        } else if let Some(number) = word.strip_suffix(['K', 'k']) {
+            let kelvin: i32 = number.parse().map_err(|_| format!("{} is not a temperature", word))?;
+            if !(2900..=7000).contains(&kelvin) {
+                return Err(format!("temperature {} is outside 2900K-7000K", word));
+            }
+            let mired = (1_000_000.0 / kelvin as f64).round() as i32;
+            let mired = mired.clamp(TEMPERATURE_MIN, TEMPERATURE_MAX);
+            if setting.temperature.replace(mired).is_some() {
+                return Err("temperature given twice".into());
+            }
+        } else {
+            let mired: i32 = word
+                .parse()
+                .map_err(|_| format!("expected off, on, a brightness like 40%, or a temperature like 213 or 4700K, not {}", word))?;
+            if !(TEMPERATURE_MIN..=TEMPERATURE_MAX).contains(&mired) {
+                return Err(format!("temperature {} is outside {}-{} mireds", word, TEMPERATURE_MIN, TEMPERATURE_MAX));
+            }
+            if setting.temperature.replace(mired).is_some() {
+                return Err("temperature given twice".into());
+            }
+        }
+    }
+
+    Ok(setting)
 }
 
 struct Section {
@@ -246,7 +395,7 @@ mod tests {
             host = 192.0.2.81
         ";
         assert_eq!(
-            parse(text).unwrap(),
+            parse(text).unwrap().lights,
             [
                 light("MK.2", None, Some("192.0.2.93"), Shape::Panel),
                 light("Air", None, Some("192.0.2.81"), Shape::Air),
@@ -257,14 +406,14 @@ mod tests {
     #[test]
     fn parse_tolerates_spacing_and_case() {
         let text = "[ Key ]\n  host=key.local  \nshape = PANEL\n";
-        assert_eq!(parse(text).unwrap(), [light("Key", None, Some("key.local"), Shape::Panel)]);
+        assert_eq!(parse(text).unwrap().lights, [light("Key", None, Some("key.local"), Shape::Panel)]);
     }
 
     #[test]
     fn parse_takes_an_id_with_or_without_a_host() {
         let text = "[Key]\nid = 00-00-5e-00-53-01\n[Air]\nid = 00:00:5E:00:53:02\nhost = 192.0.2.5\nshape = air\n";
         assert_eq!(
-            parse(text).unwrap(),
+            parse(text).unwrap().lights,
             [
                 light("Key", Some("00:00:5E:00:53:01"), None, Shape::Panel),
                 light("Air", Some("00:00:5E:00:53:02"), Some("192.0.2.5"), Shape::Air),
@@ -290,7 +439,7 @@ mod tests {
         let four: String = (1..=4).map(|n| format!("[L{}]\nhost = h{}\n", n, n)).collect();
         fails(&four, "only room for 3");
         let three: String = (1..=3).map(|n| format!("[L{}]\nhost = h{}\n", n, n)).collect();
-        assert_eq!(parse(&three).unwrap().len(), 3);
+        assert_eq!(parse(&three).unwrap().lights.len(), 3);
     }
 
     #[test]
@@ -317,6 +466,118 @@ mod tests {
     #[test]
     fn example_file_parses() {
         let text = include_str!("../lights.conf.example");
-        assert!(!parse(text).unwrap().is_empty());
+        let config = parse(text).unwrap();
+        assert!(!config.lights.is_empty());
+        assert!(!config.presets.is_empty());
+    }
+
+    const LIGHTS: &str = "[MK.2]\nhost = a\n[Key]\nhost = b\n[Air]\nhost = c\n";
+
+    fn on(brightness: Option<i32>, temperature: Option<i32>) -> Setting {
+        Setting { on: true, brightness, temperature }
+    }
+
+    const OFF: Setting = Setting { on: false, brightness: None, temperature: None };
+
+    #[test]
+    fn parse_reads_presets_in_order() {
+        let text = format!(
+            "{}[preset Full]\nAir = 57% 192\nKey = 57% 192\nMK.2 = 20% 229\n\n[preset Soft]\nAir = 14% 344\nMK.2 = off\n",
+            LIGHTS
+        );
+        let config = parse(&text).unwrap();
+        assert_eq!(config.lights.len(), 3);
+        assert_eq!(
+            config.presets,
+            [
+                Preset {
+                    name: "Full".into(),
+                    settings: vec![
+                        ("Air".into(), on(Some(57), Some(192))),
+                        ("Key".into(), on(Some(57), Some(192))),
+                        ("MK.2".into(), on(Some(20), Some(229))),
+                    ],
+                },
+                Preset {
+                    name: "Soft".into(),
+                    settings: vec![("Air".into(), on(Some(14), Some(344))), ("MK.2".into(), OFF)],
+                },
+            ]
+        );
+        assert_eq!(config.presets[1].setting("Key"), None);
+        assert_eq!(config.presets[1].setting("MK.2"), Some(OFF));
+    }
+
+    #[test]
+    fn presets_may_come_before_the_lights() {
+        let text = format!("[preset Dim]\nKey = 5%\n{}", LIGHTS);
+        let config = parse(&text).unwrap();
+        assert_eq!(config.presets[0].setting("Key"), Some(on(Some(5), None)));
+        assert_eq!(config.lights.len(), 3);
+    }
+
+    #[test]
+    fn setting_forms() {
+        assert_eq!(setting("off"), Ok(OFF));
+        assert_eq!(setting("on"), Ok(on(None, None)));
+        assert_eq!(setting("40%"), Ok(on(Some(40), None)));
+        assert_eq!(setting("213"), Ok(on(None, Some(213))));
+        assert_eq!(setting("on 40% 213"), Ok(on(Some(40), Some(213))));
+        assert_eq!(setting("213   40%"), Ok(on(Some(40), Some(213))));
+        assert_eq!(setting("0%"), Ok(on(Some(0), None)));
+    }
+
+    #[test]
+    fn setting_takes_kelvin() {
+        assert_eq!(setting("5000K"), Ok(on(None, Some(200))));
+        assert_eq!(setting("4700k"), Ok(on(None, Some(213))));
+        // The ends of the range round just outside it, and are pulled back in.
+        assert_eq!(setting("2900K"), Ok(on(None, Some(TEMPERATURE_MAX))));
+        assert_eq!(setting("7000K"), Ok(on(None, Some(TEMPERATURE_MIN))));
+    }
+
+    #[test]
+    fn setting_rejects_mistakes() {
+        for (value, expected) in [
+            ("off 20%", "off takes nothing else"),
+            ("101%", "outside 0-100%"),
+            ("-1%", "outside 0-100%"),
+            ("x%", "not a brightness"),
+            ("2000K", "outside 2900K-7000K"),
+            ("8000K", "outside 2900K-7000K"),
+            ("warmK", "not a temperature"),
+            ("3100", "outside 143-344 mireds"),
+            ("100", "outside 143-344 mireds"),
+            ("bright", "expected off, on"),
+            ("20% 30%", "brightness given twice"),
+            ("200 5000K", "temperature given twice"),
+        ] {
+            let problem = setting(value).unwrap_err();
+            assert!(problem.contains(expected), "{:?} gave {:?}", value, problem);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_preset_mistakes() {
+        fails(&format!("{}[preset ]\n", LIGHTS), "line 7: preset has no name");
+        fails(&format!("{}[preset A]\nKey = on\n[preset A]\nKey = off\n", LIGHTS), "line 9: [preset A] appears twice");
+        fails(&format!("{}[preset A]\n", LIGHTS), "line 7: [preset A] sets no lights");
+        fails(&format!("{}[preset A]\nLamp = on\n", LIGHTS), "line 8: Lamp is not one of the lights");
+        fails(&format!("{}[preset A]\nKey = on\nKey = off\n", LIGHTS), "line 9: Key given twice");
+        fails(&format!("{}[preset A]\nKey = 120%\n", LIGHTS), "line 8: Key: brightness 120% is outside");
+        fails(&format!("{}[preset A]\nKey\n", LIGHTS), "line 8: expected setting = value");
+        fails(&format!("{}[preset A]\nKey =\n", LIGHTS), "line 8: Key has no value");
+
+        let nine: String = (1..=9).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
+        fails(&format!("{}{}", LIGHTS, nine), "9 presets configured, but there is only room for 8");
+        let eight: String = (1..=8).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
+        assert_eq!(parse(&format!("{}{}", LIGHTS, eight)).unwrap().presets.len(), 8);
+    }
+
+    #[test]
+    fn light_settings_after_a_preset_belong_to_the_next_light() {
+        let text = "[preset A]\nKey = on\n[Key]\nhost = b\nshape = air\n";
+        let config = parse(text).unwrap();
+        assert_eq!(config.lights[0].shape, Shape::Air);
     }
 }

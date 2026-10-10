@@ -16,7 +16,7 @@ use elgato_streamdeck::info::Kind;
 use elgato_streamdeck::{list_devices, new_hidapi, DeviceStateUpdate, StreamDeck};
 use image::DynamicImage;
 
-use config::{LightConfig, BRIGHTNESS_STEP, TEMPERATURE_STEP};
+use config::{Config, LightConfig, Preset, BRIGHTNESS_STEP, TEMPERATURE_STEP};
 use discovery::Directory;
 use idle::Idle;
 use lights::Lights;
@@ -161,7 +161,7 @@ fn find(configs: Vec<LightConfig>) -> Lights {
     lights
 }
 
-fn configured(config: Option<PathBuf>) -> Result<Vec<LightConfig>, Box<dyn Error>> {
+fn configured(config: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
     let path = config
         .or_else(config::default_path)
         .ok_or("HOME is not set; give the lights file with --config")?;
@@ -172,21 +172,30 @@ fn configured(config: Option<PathBuf>) -> Result<Vec<LightConfig>, Box<dyn Error
 fn preview(config: Option<PathBuf>, directory: &str) -> Result<(), Box<dyn Error>> {
     use image::{GenericImage, RgbImage};
 
-    let configs = configured(config)?;
+    let config = configured(config)?;
     std::fs::create_dir_all(directory)?;
 
     let renderer = Renderer::new()?;
-    let lights = find(configs);
+    let lights = find(config.lights);
     let modes = [Dial::Brightness, Dial::Temperature, Dial::Brightness, Dial::Temperature];
 
     let status = media::Status { present: true, playing: true, muted: true };
 
     let mut sheet = RgbImage::new(render::KEY * 4, render::KEY * 2);
     for key in 0..8u32 {
-        let image = key_image(&renderer, &lights, &status, key as usize);
+        let image = key_image(&renderer, &lights, &status, None, key as usize);
         sheet.copy_from(&image.to_rgb8(), (key % 4) * render::KEY, (key / 4) * render::KEY)?;
     }
     sheet.save(format!("{}/keys.png", directory))?;
+
+    if !config.presets.is_empty() {
+        let mut sheet = RgbImage::new(render::KEY * 4, render::KEY * 2);
+        for key in 0..8u32 {
+            let image = key_image(&renderer, &lights, &status, Some(&config.presets), key as usize);
+            sheet.copy_from(&image.to_rgb8(), (key % 4) * render::KEY, (key / 4) * render::KEY)?;
+        }
+        sheet.save(format!("{}/presets.png", directory))?;
+    }
 
     let mut strip = RgbImage::new(render::ZONE_WIDTH * 4, render::ZONE_HEIGHT);
     for zone in 0..4usize {
@@ -195,12 +204,13 @@ fn preview(config: Option<PathBuf>, directory: &str) -> Result<(), Box<dyn Error
     }
     strip.save(format!("{}/lcd.png", directory))?;
 
-    println!("wrote {}/keys.png and {}/lcd.png", directory, directory);
+    println!("wrote keys.png, lcd.png and any presets.png to {}", directory);
     Ok(())
 }
 
 fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box<dyn Error>> {
-    let configs = configured(config)?;
+    let config = configured(config)?;
+    let presets = config.presets;
 
     let hidapi = new_hidapi()?;
     let (kind, serial) = list_devices(&hidapi)
@@ -213,7 +223,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     deck.set_brightness(brightness)?;
 
     let renderer = Renderer::new()?;
-    let mut lights = find(configs);
+    let mut lights = find(config.lights);
     let media = Media::start();
     let mut modes = [Dial::Brightness; 4];
 
@@ -228,6 +238,8 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     }
 
     let mut dirty = Dirty::all();
+    // Swiping the LCD swaps all eight keys for the presets until one is chosen.
+    let mut picking = false;
     let mut generation = media.generation();
     let mut idle = Idle::new(config::IDLE, Instant::now());
     let mut dark = false;
@@ -246,6 +258,19 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             }
 
             match update {
+                DeviceStateUpdate::TouchScreenSwipe(..) if !presets.is_empty() => {
+                    picking = !picking;
+                    dirty.keys = [true; 8];
+                }
+
+                DeviceStateUpdate::ButtonDown(key) if picking => {
+                    if let Some(preset) = presets.get(key as usize) {
+                        lights.recall(preset);
+                        picking = false;
+                        dirty = Dirty::all();
+                    }
+                }
+
                 DeviceStateUpdate::ButtonDown(key) => match key {
                     0 => media.send(Action::Previous),
                     1 => media.send(Action::PlayPause),
@@ -324,7 +349,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             deck.set_brightness(if dark { 0 } else { brightness })?;
         }
 
-        paint(&deck, &renderer, &lights, &media, &modes, &mut dirty)?;
+        paint(&deck, &renderer, &lights, &media, &modes, picking.then_some(&presets[..]), &mut dirty)?;
     }
 }
 
@@ -342,6 +367,7 @@ fn paint(
     lights: &Lights,
     media: &Media,
     modes: &[Dial; 4],
+    picker: Option<&[Preset]>,
     dirty: &mut Dirty,
 ) -> Result<(), Box<dyn Error>> {
     let status = media.status();
@@ -354,7 +380,7 @@ fn paint(
         dirty.keys[key] = false;
         flush = true;
 
-        let image = key_image(renderer, lights, &status, key);
+        let image = key_image(renderer, lights, &status, picker, key);
         deck.set_button_image(key as u8, image)?;
     }
 
@@ -388,7 +414,20 @@ impl Dirty {
     }
 }
 
-fn key_image(renderer: &Renderer, lights: &Lights, status: &media::Status, key: usize) -> DynamicImage {
+fn key_image(
+    renderer: &Renderer,
+    lights: &Lights,
+    status: &media::Status,
+    picker: Option<&[Preset]>,
+    key: usize,
+) -> DynamicImage {
+    if let Some(presets) = picker {
+        return match presets.get(key) {
+            Some(preset) => renderer.preset_key(preset),
+            None => renderer.empty_key(),
+        };
+    }
+
     match key {
         0..=3 => renderer.media_key(key as u8, status),
         4..=6 => match lights.items.get(key - 4) {

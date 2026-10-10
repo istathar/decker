@@ -3,7 +3,7 @@ use std::error::Error;
 use fontdue::Font;
 use image::{DynamicImage, RgbImage};
 
-use crate::config::{self, Shape};
+use crate::config::{self, Preset, Shape};
 use crate::lights::State;
 use crate::media::Status;
 use crate::Dial;
@@ -118,6 +118,28 @@ impl Renderer {
 
         self.text(&mut canvas, "ALL", 19.0, 60, 28, TEXT, Align::Centre);
         power(&mut canvas, 60, 76, 21, 7, ink);
+
+        DynamicImage::ImageRgb8(canvas)
+    }
+
+    /// A preset in the picker: its name over a bulb glowing the colour and
+    /// intensity the preset sets, or unlit if it only turns lights off.
+    pub fn preset_key(&self, preset: &Preset) -> DynamicImage {
+        let mut canvas = RgbImage::from_pixel(KEY, KEY, image::Rgb(BACKGROUND));
+
+        let mut size = 19.0;
+        while size > 11.0 && self.width(&preset.name, size) > (KEY - 10) as f32 {
+            size -= 1.0;
+        }
+        self.text(&mut canvas, &preset.name, size, 60, 28, TEXT, Align::Centre);
+
+        let glass = appearance(preset).map(|(brightness, temperature)| {
+            let colour = tint(coolness(temperature));
+            let level = 0.3 + 0.7 * (brightness as f32 / config::BRIGHTNESS_MAX as f32).sqrt();
+            mix(BACKGROUND, colour, level)
+        });
+        // Outline and base in the same grey as the light keys' icons.
+        bulb(&mut canvas, 60, 60, glass, FAINT, BACKGROUND);
 
         DynamicImage::ImageRgb8(canvas)
     }
@@ -385,6 +407,24 @@ fn stroke(canvas: &mut RgbImage, x0: i32, y0: i32, x1: i32, y1: i32, weight: i32
     }
 }
 
+/// What one bulb should show for a whole preset: the brightest light it turns
+/// on, at the brightness-weighted colour of those lights. None if it turns no
+/// light on. Unspecified values are taken as middling.
+fn appearance(preset: &Preset) -> Option<(i32, i32)> {
+    let lit: Vec<(i32, i32)> = preset
+        .settings
+        .iter()
+        .filter(|(_, setting)| setting.on)
+        .map(|(_, setting)| (setting.brightness.unwrap_or(50), setting.temperature.unwrap_or(230)))
+        .collect();
+
+    let brightest = lit.iter().map(|(brightness, _)| *brightness).max()?;
+    let weight: i32 = lit.iter().map(|(brightness, _)| brightness + 1).sum();
+    let temperature = lit.iter().map(|(brightness, temperature)| (brightness + 1) * temperature).sum::<i32>() / weight;
+
+    Some((brightest, temperature))
+}
+
 /// Where a temperature sits between the warmest and coolest a light can do,
 /// 0.0 warm to 1.0 cool, evenly in Kelvin as the display reads.
 fn coolness(temperature: i32) -> f32 {
@@ -392,6 +432,62 @@ fn coolness(temperature: i32) -> f32 {
     let cool = config::kelvin(config::TEMPERATURE_MIN) as f32;
     let now = config::kelvin(temperature) as f32;
     ((now - warm) / (cool - warm)).clamp(0.0, 1.0)
+}
+
+fn mix(from: [u8; 3], to: [u8; 3], amount: f32) -> [u8; 3] {
+    let mut out = [0u8; 3];
+    for channel in 0..3 {
+        out[channel] = (from[channel] as f32 + (to[channel] as f32 - from[channel] as f32) * amount).round() as u8;
+    }
+    out
+}
+
+/// Filled circle, antialiased.
+fn disc(canvas: &mut RgbImage, cx: i32, cy: i32, radius: f32, colour: [u8; 3]) {
+    let reach = radius.ceil() as i32 + 1;
+    for row in -reach..=reach {
+        for column in -reach..=reach {
+            let distance = ((column * column + row * row) as f32).sqrt();
+            let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(canvas, cx + column, cy + row, colour, (coverage * 255.0) as u8);
+            }
+        }
+    }
+}
+
+/// A light bulb: round glass narrowing to a neck, on a screw base. Outlined
+/// and based in `metal`; the glass is filled with `glass` when lit, otherwise
+/// left showing `behind`.
+fn bulb(canvas: &mut RgbImage, cx: i32, cy: i32, glass: Option<[u8; 3]>, metal: [u8; 3], behind: [u8; 3]) {
+    let top = cy + 8;
+    let bottom = cy + 25;
+
+    silhouette(canvas, cx, cy, top, bottom, 0.0, metal);
+    // As thick as the bezel on the light keys' icons.
+    silhouette(canvas, cx, cy, top, bottom, 5.0, glass.unwrap_or(behind));
+
+    // Screw base: one solid block straight under the neck, with dark grooves
+    // for the thread so it reads as a screw on any key colour, then the contact.
+    let groove = mix(metal, [0, 0, 0], 0.55);
+    rounded(canvas, cx - 8, bottom, 16, 12, 2, metal);
+    bar(canvas, cx - 7, bottom + 4, 14, 1, groove);
+    bar(canvas, cx - 7, bottom + 8, 14, 1, groove);
+    rounded(canvas, cx - 4, bottom + 11, 8, 4, 2, metal);
+}
+
+/// The glass and neck of the bulb, shrunk by `inset` on every side.
+fn silhouette(canvas: &mut RgbImage, cx: i32, cy: i32, top: i32, bottom: i32, inset: f32, colour: [u8; 3]) {
+    let end = bottom - inset.round() as i32;
+    for row in top..=end {
+        let t = (row - top) as f32 / (bottom - top) as f32;
+        let half = 12.0 - 4.5 * t - inset;
+        for column in (-half.ceil() as i32)..=(half.ceil() as i32) {
+            let coverage = (half + 0.5 - column.abs() as f32).clamp(0.0, 1.0);
+            blend(canvas, cx + column, row, colour, (coverage * 255.0) as u8);
+        }
+    }
+    disc(canvas, cx, cy, 18.0 - inset, colour);
 }
 
 /// Approximate the light's own colour, warm through cool.
@@ -538,6 +634,23 @@ mod tests {
         let zone = rgb(&renderer.empty_zone());
         assert_eq!((zone.width(), zone.height()), (ZONE_WIDTH, ZONE_HEIGHT));
         assert!(zone.pixels().all(|pixel| pixel.0 == GUTTER || pixel.0 == PANEL));
+    }
+
+    #[test]
+    fn preset_key_lights_its_bulb() {
+        let renderer = renderer();
+        let setting = config::Setting { on: true, brightness: Some(50), temperature: Some(200) };
+        let mut preset = Preset { name: "Work".into(), settings: vec![("Key".into(), setting)] };
+
+        let lit = rgb(&renderer.preset_key(&preset));
+        assert_ne!(at(&lit, 60, 60), BACKGROUND);
+        assert_eq!(at(&lit, 35, 80), BACKGROUND);
+
+        // A preset that only turns lights off shows a hollow, unlit bulb.
+        preset.settings[0].1 = config::Setting { on: false, brightness: None, temperature: None };
+        let unlit = rgb(&renderer.preset_key(&preset));
+        assert_eq!(at(&unlit, 60, 60), BACKGROUND);
+        assert_eq!(at(&unlit, 60, 43), FAINT);
     }
 
     #[test]

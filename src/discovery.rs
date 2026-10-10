@@ -288,7 +288,7 @@ mod tests {
         );
 
         found.model = "Elgato Key Light Air 20LAX9901".into();
-        let parsed = config::parse(&section(&found)).unwrap();
+        let parsed = config::parse(&section(&found)).unwrap().lights;
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "5301");
         assert_eq!(parsed[0].id.as_deref(), Some(MAC));

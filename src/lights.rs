@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use ureq::Agent;
 
-use crate::config::{self, LightConfig};
+use crate::config::{self, LightConfig, Preset, Setting};
 use crate::discovery::Directory;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -106,6 +106,19 @@ impl Light {
             .clamp(config::TEMPERATURE_MIN, config::TEMPERATURE_MAX);
         self.push(state);
     }
+
+    /// Take on a preset's setting, keeping whatever it leaves unspecified.
+    pub fn apply(&mut self, setting: Setting) {
+        let mut state = self.state;
+        state.on = setting.on;
+        if let Some(brightness) = setting.brightness {
+            state.brightness = brightness.clamp(config::BRIGHTNESS_MIN, config::BRIGHTNESS_MAX);
+        }
+        if let Some(temperature) = setting.temperature {
+            state.temperature = temperature.clamp(config::TEMPERATURE_MIN, config::TEMPERATURE_MAX);
+        }
+        self.push(state);
+    }
 }
 
 /// What a worker learned from its light: the state it read or wrote, or None
@@ -199,6 +212,15 @@ impl Lights {
         }
 
         (light.state, light.online) != before
+    }
+
+    /// Set every light the preset names; the others are left alone.
+    pub fn recall(&mut self, preset: &Preset) {
+        for light in &mut self.items {
+            if let Some(setting) = preset.setting(light.name()) {
+                light.apply(setting);
+            }
+        }
     }
 
     pub fn any_on(&self) -> bool {
@@ -593,6 +615,56 @@ mod tests {
             assert_eq!(parse(&body), Some(state));
         }
         assert_eq!(payload(lit(1, 200))["lights"][0]["on"], 1);
+    }
+
+    fn named(name: &str, state: State) -> (Light, Receiver<Change>) {
+        let mut config = sample();
+        config.name = name.into();
+        Light::detached(config, state)
+    }
+
+    #[test]
+    fn apply_keeps_what_the_setting_leaves_out() {
+        let (mut light, receiver) = Light::detached(sample(), State { on: false, brightness: 30, temperature: 250 });
+        light.apply(Setting { on: true, brightness: Some(57), temperature: None });
+        assert_eq!(light.state, lit(57, 250));
+        light.apply(Setting { on: true, brightness: None, temperature: Some(192) });
+        assert_eq!(light.state, lit(57, 192));
+        light.apply(Setting { on: false, brightness: None, temperature: None });
+        assert_eq!(light.state, State { on: false, brightness: 57, temperature: 192 });
+        assert_eq!(sent(&receiver).len(), 3);
+
+        light.apply(Setting { on: false, brightness: None, temperature: None });
+        assert!(sent(&receiver).is_empty(), "already there");
+    }
+
+    #[test]
+    fn recall_sets_named_lights_only() {
+        let mut items = Vec::new();
+        let mut receivers = Vec::new();
+        for name in ["MK.2", "Key", "Air"] {
+            let (light, receiver) = named(name, lit(50, 200));
+            items.push(light);
+            receivers.push(receiver);
+        }
+        let (_reporter, reports) = channel();
+        let mut lights = Lights { items, reports };
+
+        let soft = Preset {
+            name: "Soft".into(),
+            settings: vec![
+                ("Air".into(), Setting { on: true, brightness: Some(14), temperature: Some(344) }),
+                ("MK.2".into(), Setting { on: false, brightness: None, temperature: None }),
+            ],
+        };
+        lights.recall(&soft);
+
+        assert_eq!(lights.items[0].state, State { on: false, brightness: 50, temperature: 200 });
+        assert_eq!(lights.items[1].state, lit(50, 200));
+        assert_eq!(lights.items[2].state, lit(14, 344));
+        assert_eq!(sent(&receivers[0]).len(), 1);
+        assert!(sent(&receivers[1]).is_empty());
+        assert_eq!(sent(&receivers[2]), [lit(14, 344)]);
     }
 
     #[test]

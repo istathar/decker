@@ -18,3 +18,33 @@ host = 192.0.2.97
 [Air]
 host = 192.0.2.81
 shape = air
+
+# Presets, at most eight. Swipe across the LCD to show them on the keys;
+# pressing one sets the lights and returns to the normal keys, swiping again
+# returns without changing anything. Each line sets one light by name:
+#
+#   off                      turn it off
+#   on, 40%, 213 or 4700K    turn it on; give brightness and/or temperature
+#                            (mireds like the Elgato API, or Kelvin) to set them
+#
+# A light a preset doesn't mention is left as it is.
+
+[preset Work]
+MK.2 = 2% 310
+Key = 2% 310
+Air = 3% 295
+
+[preset Soft]
+MK.2 = off
+Key = off
+Air = 14% 344
+
+[preset Read]
+MK.2 = 8% 265
+Key = 5% 300
+Air = 25% 192
+
+[preset Full]
+MK.2 = 20% 229
+Key = 57% 192
+Air = 57% 192
