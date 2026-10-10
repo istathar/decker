@@ -1,4 +1,5 @@
 mod config;
+mod discovery;
 mod lights;
 mod media;
 mod render;
@@ -15,6 +16,7 @@ use elgato_streamdeck::{list_devices, new_hidapi, DeviceStateUpdate, StreamDeck}
 use image::DynamicImage;
 
 use config::{LightConfig, BRIGHTNESS_STEP, TEMPERATURE_STEP};
+use discovery::Directory;
 use lights::Lights;
 use media::{Action, Media};
 use render::Renderer;
@@ -120,9 +122,14 @@ fn list() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Connect, and wait for each light's first answer, all of them in parallel.
+/// Give mDNS a moment to find lights configured by id, then connect and
+/// wait for each light's first answer, all of them in parallel.
 fn find(configs: Vec<LightConfig>) -> Lights {
-    let mut lights = Lights::connect(configs);
+    let directory = Directory::start();
+    let ids: Vec<&str> = configs.iter().filter_map(|config| config.id.as_deref()).collect();
+    directory.wait(&ids, config::DISCOVERY);
+
+    let mut lights = Lights::connect(configs, &directory);
     lights.settle(config::HTTP_TIMEOUT + Duration::from_millis(500));
     lights
 }
@@ -188,7 +195,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
         println!(
             "  {:<5} {:<21} {}",
             light.name(),
-            light.address(),
+            light.address().unwrap_or_else(|| "not found".into()),
             if light.online() { "ok" } else { "unreachable" }
         );
     }
@@ -376,7 +383,7 @@ mod tests {
 
     fn light() -> Light {
         let state = State { on: true, brightness: 50, temperature: 200 };
-        let config = LightConfig { name: "Key".into(), host: "192.0.2.1".into(), shape: config::Shape::Panel };
+        let config = LightConfig { name: "Key".into(), id: None, host: Some("192.0.2.1".into()), shape: config::Shape::Panel };
         Light::detached(config, state).0
     }
 

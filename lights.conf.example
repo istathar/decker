@@ -1,13 +1,17 @@
 # Copy to ~/.config/decker/lights.conf. One section per light, in order left
 # to right across the deck, at most three.
 #
-#   host   address of the light
+#   id     MAC address; the light is found over mDNS wherever it is
+#   host   fixed address, used until (or unless) the light is found by id
 #   shape  panel (Key Light, MK.2) or air (Key Light Air); panel if left out
+#
+# Each light needs an id, a host, or both.
 
 [MK.2]
 host = 192.0.2.93
 
 [Key]
+id = 00:00:5E:00:53:01
 host = 192.0.2.97
 
 [Air]

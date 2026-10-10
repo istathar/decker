@@ -5,7 +5,10 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LightConfig {
     pub name: String,
-    pub host: String,
+    /// MAC address, by which the light is found over mDNS.
+    pub id: Option<String>,
+    /// Fixed address, used when there is no id or the light hasn't been found by it.
+    pub host: Option<String>,
     pub shape: Shape,
 }
 
@@ -39,6 +42,9 @@ pub const DEBOUNCE: Duration = Duration::from_millis(40);
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long to wait at startup for lights to be found over mDNS.
+pub const DISCOVERY: Duration = Duration::from_secs(3);
+
 /// How long a light goes without being written to before its state is
 /// re-read, in case something else changed it.
 pub const RESYNC: Duration = Duration::from_secs(30);
@@ -68,6 +74,7 @@ pub fn load(path: &Path) -> Result<Vec<LightConfig>, Box<dyn Error>> {
 ///
 /// ```text
 /// [Key]
+/// id = 00:00:5E:00:53:01
 /// host = 192.0.2.20
 /// shape = panel
 /// ```
@@ -94,7 +101,7 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
             if sections.iter().any(|section| section.name == name) {
                 return Err(format!("line {}: [{}] appears twice", number, name));
             }
-            sections.push(Section { name: name.to_string(), line: number, host: None, shape: None });
+            sections.push(Section { name: name.to_string(), line: number, id: None, host: None, shape: None });
             continue;
         }
 
@@ -112,6 +119,11 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
             .ok_or_else(|| format!("line {}: {} comes before any [light] section", number, key))?;
 
         match key {
+            "id" => {
+                let id = mac(value)
+                    .ok_or_else(|| format!("line {}: id is a MAC address like 00:00:5E:00:53:01, not {}", number, value))?;
+                set(&mut section.id, id, number, key)?
+            }
             "host" => set(&mut section.host, value.to_string(), number, key)?,
             "shape" => {
                 let shape = match value.to_lowercase().as_str() {
@@ -137,18 +149,33 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
 struct Section {
     name: String,
     line: usize,
+    id: Option<String>,
     host: Option<String>,
     shape: Option<Shape>,
 }
 
 impl Section {
     fn finish(self) -> Result<LightConfig, String> {
-        let host = self
-            .host
-            .ok_or_else(|| format!("line {}: [{}] needs a host", self.line, self.name))?;
+        if self.id.is_none() && self.host.is_none() {
+            return Err(format!("line {}: [{}] needs an id or a host", self.line, self.name));
+        }
 
-        Ok(LightConfig { name: self.name, host, shape: self.shape.unwrap_or(Shape::Panel) })
+        Ok(LightConfig {
+            name: self.name,
+            id: self.id,
+            host: self.host,
+            shape: self.shape.unwrap_or(Shape::Panel),
+        })
     }
+}
+
+/// A MAC address in canonical form, upper case and colon separated. Colons
+/// or hyphens are accepted between the octets.
+pub fn mac(text: &str) -> Option<String> {
+    let octets: Vec<&str> = text.trim().split([':', '-']).collect();
+    let valid = octets.len() == 6
+        && octets.iter().all(|octet| octet.len() == 2 && octet.chars().all(|c| c.is_ascii_hexdigit()));
+    valid.then(|| octets.join(":").to_uppercase())
 }
 
 fn set<T>(slot: &mut Option<T>, value: T, number: usize, key: &str) -> Result<(), String> {
@@ -193,8 +220,8 @@ mod tests {
         }
     }
 
-    fn light(name: &str, host: &str, shape: Shape) -> LightConfig {
-        LightConfig { name: name.into(), host: host.into(), shape }
+    fn light(name: &str, id: Option<&str>, host: Option<&str>, shape: Shape) -> LightConfig {
+        LightConfig { name: name.into(), id: id.map(Into::into), host: host.map(Into::into), shape }
     }
 
     fn fails(text: &str, expected: &str) {
@@ -217,8 +244,8 @@ mod tests {
         assert_eq!(
             parse(text).unwrap(),
             [
-                light("MK.2", "192.0.2.93", Shape::Panel),
-                light("Air", "192.0.2.81", Shape::Air),
+                light("MK.2", None, Some("192.0.2.93"), Shape::Panel),
+                light("Air", None, Some("192.0.2.81"), Shape::Air),
             ]
         );
     }
@@ -226,7 +253,30 @@ mod tests {
     #[test]
     fn parse_tolerates_spacing_and_case() {
         let text = "[ Key ]\n  host=key.local  \nshape = PANEL\n";
-        assert_eq!(parse(text).unwrap(), [light("Key", "key.local", Shape::Panel)]);
+        assert_eq!(parse(text).unwrap(), [light("Key", None, Some("key.local"), Shape::Panel)]);
+    }
+
+    #[test]
+    fn parse_takes_an_id_with_or_without_a_host() {
+        let text = "[Key]\nid = 00-00-5e-00-53-01\n[Air]\nid = 00:00:5E:00:53:02\nhost = 192.0.2.5\nshape = air\n";
+        assert_eq!(
+            parse(text).unwrap(),
+            [
+                light("Key", Some("00:00:5E:00:53:01"), None, Shape::Panel),
+                light("Air", Some("00:00:5E:00:53:02"), Some("192.0.2.5"), Shape::Air),
+            ]
+        );
+    }
+
+    #[test]
+    fn mac_normalises_and_validates() {
+        assert_eq!(mac("00:00:5e:00:53:01").as_deref(), Some("00:00:5E:00:53:01"));
+        assert_eq!(mac(" 00-00-5E-00-53-01 ").as_deref(), Some("00:00:5E:00:53:01"));
+        assert_eq!(mac("00:00:5E:00:53"), None);
+        assert_eq!(mac("00:00:5E:00:53:01:00"), None);
+        assert_eq!(mac("00:00:5E:00:53:0G"), None);
+        assert_eq!(mac("00005E005301"), None);
+        assert_eq!(mac(""), None);
     }
 
     #[test]
@@ -241,7 +291,8 @@ mod tests {
 
     #[test]
     fn parse_rejects_mistakes_with_line_numbers() {
-        fails("[Key]\n", "line 1: [Key] needs a host");
+        fails("[Key]\n", "line 1: [Key] needs an id or a host");
+        fails("[Key]\nid = 3C:6A\n", "line 2: id is a MAC address");
         fails("host = a\n", "line 1: host comes before any [light] section");
         fails("[Key\nhost = a\n", "line 1: section header");
         fails("[]\nhost = a\n", "line 1: light has no name");

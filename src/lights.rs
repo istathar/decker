@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use ureq::Agent;
 
 use crate::config::{self, LightConfig};
+use crate::discovery::Directory;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct State {
@@ -17,6 +18,29 @@ pub struct State {
 impl Default for State {
     fn default() -> Self {
         State { on: false, brightness: 20, temperature: 230 }
+    }
+}
+
+/// How to reach a light: where mDNS last saw it, otherwise its configured host.
+#[derive(Clone)]
+pub struct Locator {
+    id: Option<String>,
+    host: Option<String>,
+    directory: Directory,
+}
+
+impl Locator {
+    pub fn new(config: &LightConfig, directory: &Directory) -> Self {
+        Locator { id: config.id.clone(), host: config.host.clone(), directory: directory.clone() }
+    }
+
+    /// host:port, looked up afresh each time so a light that moves is followed.
+    /// None if the light has no host and hasn't been found by its id.
+    pub fn address(&self) -> Option<String> {
+        if let Some(found) = self.id.as_deref().and_then(|id| self.directory.lookup(id)) {
+            return Some(found.to_string());
+        }
+        self.host.as_ref().map(|host| format!("{}:{}", host, config::PORT))
     }
 }
 
@@ -32,8 +56,7 @@ pub struct Light {
     known: bool,
     /// Bumped with every change handed to the worker.
     sequence: u64,
-    /// host:port of its control API.
-    address: String,
+    locator: Locator,
     sender: Sender<Change>,
 }
 
@@ -46,8 +69,8 @@ impl Light {
         self.online
     }
 
-    pub fn address(&self) -> &str {
-        &self.address
+    pub fn address(&self) -> Option<String> {
+        self.locator.address()
     }
 
     /// Record the new state locally and hand it to the worker. Never blocks.
@@ -102,22 +125,22 @@ pub struct Lights {
 impl Lights {
     /// Start a worker per light. Each reads its light straight away; use
     /// `settle` to wait for that, and `poll` to pick up reports thereafter.
-    pub fn connect(configs: Vec<LightConfig>) -> Self {
+    pub fn connect(configs: Vec<LightConfig>, directory: &Directory) -> Self {
         let (reporter, reports) = channel();
 
         let items = configs
             .into_iter()
             .enumerate()
             .map(|(index, config)| {
-                let address = format!("{}:{}", config.host, config::PORT);
+                let locator = Locator::new(&config, directory);
                 Light {
-                    sender: spawn(index, address.clone(), reporter.clone()),
+                    sender: spawn(index, locator.clone(), reporter.clone()),
                     config,
                     state: State::default(),
                     online: false,
                     known: false,
                     sequence: 0,
-                    address,
+                    locator,
                 }
             })
             .collect();
@@ -257,7 +280,7 @@ fn payload(state: State) -> Value {
 
 /// One worker per light, owning all its network traffic, so the event loop is
 /// never waiting on the network.
-fn spawn(index: usize, address: String, reports: Sender<Report>) -> Sender<Change> {
+fn spawn(index: usize, locator: Locator, reports: Sender<Report>) -> Sender<Change> {
     let (sender, receiver) = channel();
 
     thread::spawn(move || {
@@ -265,8 +288,8 @@ fn spawn(index: usize, address: String, reports: Sender<Report>) -> Sender<Chang
         work(
             &receiver,
             config::RESYNC,
-            || fetch(&agent, &address),
-            |state| send(&agent, &address, state),
+            || locator.address().and_then(|address| fetch(&agent, &address)),
+            |state| locator.address().is_some_and(|address| send(&agent, &address, state)),
             |sequence, state| reports.send(Report { index, sequence, state }).is_ok(),
         );
     });
@@ -339,7 +362,7 @@ impl Light {
     pub fn detached(config: LightConfig, state: State) -> (Self, Receiver<Change>) {
         let (sender, receiver) = channel();
         let light = Light {
-            address: format!("{}:{}", config.host, config::PORT),
+            locator: Locator::new(&config, &Directory::default()),
             config,
             state,
             online: true,
@@ -360,7 +383,7 @@ mod tests {
     }
 
     fn sample() -> LightConfig {
-        LightConfig { name: "Key".into(), host: "192.0.2.1".into(), shape: config::Shape::Panel }
+        LightConfig { name: "Key".into(), id: None, host: Some("192.0.2.1".into()), shape: config::Shape::Panel }
     }
 
     fn sent(receiver: &Receiver<Change>) -> Vec<State> {
@@ -495,6 +518,51 @@ mod tests {
     #[test]
     fn endpoint_targets_the_elgato_api() {
         assert_eq!(endpoint("192.0.2.5:9123"), "http://192.0.2.5:9123/elgato/lights");
+    }
+
+    const MAC: &str = "00:00:5E:00:53:01";
+
+    fn configured(id: Option<&str>, host: Option<&str>) -> LightConfig {
+        LightConfig { name: "Key".into(), id: id.map(Into::into), host: host.map(Into::into), shape: config::Shape::Panel }
+    }
+
+    fn sighting(last: u8) -> crate::discovery::Found {
+        crate::discovery::Found {
+            id: MAC.into(),
+            name: "Elgato Key Light 5301".into(),
+            model: String::new(),
+            addresses: vec![std::net::SocketAddr::from(([192, 0, 2, last], 9123))],
+        }
+    }
+
+    #[test]
+    fn locator_uses_the_configured_host_until_found() {
+        let directory = Directory::default();
+        let locator = Locator::new(&configured(Some(MAC), Some("192.0.2.5")), &directory);
+        assert_eq!(locator.address().as_deref(), Some("192.0.2.5:9123"));
+
+        directory.record(&sighting(97));
+        assert_eq!(locator.address().as_deref(), Some("192.0.2.97:9123"));
+
+        directory.record(&sighting(12));
+        assert_eq!(locator.address().as_deref(), Some("192.0.2.12:9123"));
+    }
+
+    #[test]
+    fn locator_without_a_host_waits_for_discovery() {
+        let directory = Directory::default();
+        let locator = Locator::new(&configured(Some(MAC), None), &directory);
+        assert_eq!(locator.address(), None);
+        directory.record(&sighting(97));
+        assert_eq!(locator.address().as_deref(), Some("192.0.2.97:9123"));
+    }
+
+    #[test]
+    fn locator_without_an_id_ignores_discovery() {
+        let directory = Directory::default();
+        directory.record(&sighting(97));
+        let locator = Locator::new(&configured(None, Some("key.local")), &directory);
+        assert_eq!(locator.address().as_deref(), Some("key.local:9123"));
     }
 
     #[test]
