@@ -1,0 +1,13 @@
+# Copy to ~/.config/decker/lights.conf. One section per light, in order left
+# to right across the deck, at most three.
+#
+#   host   address of the light
+
+[MK.2]
+host = 192.0.2.93
+
+[Key]
+host = 192.0.2.97
+
+[Air]
+host = 192.0.2.81
