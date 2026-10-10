@@ -42,6 +42,10 @@ pub const DEBOUNCE: Duration = Duration::from_millis(40);
 
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long the deck stays illuminate after every light is off and no buttons
+/// have been touched.
+pub const IDLE: Duration = Duration::from_secs(600);
+
 /// How long to wait at startup for lights to be found over mDNS.
 pub const DISCOVERY: Duration = Duration::from_secs(3);
 

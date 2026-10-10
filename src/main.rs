@@ -1,12 +1,13 @@
 mod config;
 mod discovery;
+mod idle;
 mod lights;
 mod media;
 mod render;
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::builder::{OsStr, Resettable};
 use clap::{Arg, ArgAction, Command};
@@ -17,6 +18,7 @@ use image::DynamicImage;
 
 use config::{LightConfig, BRIGHTNESS_STEP, TEMPERATURE_STEP};
 use discovery::Directory;
+use idle::Idle;
 use lights::Lights;
 use media::{Action, Media};
 use render::Renderer;
@@ -227,6 +229,8 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
 
     let mut dirty = Dirty::all();
     let mut generation = media.generation();
+    let mut idle = Idle::new(config::IDLE, Instant::now());
+    let mut dark = false;
 
     let deck = std::sync::Arc::new(deck);
     let reader = deck.get_reader();
@@ -235,6 +239,10 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
         for update in reader.read(Some(Duration::from_millis(100)))? {
             if verbose {
                 println!("{:?}", update);
+            }
+
+            if !idle.input(Instant::now()) {
+                continue;
             }
 
             match update {
@@ -308,6 +316,12 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             dirty.keys[7] = true;
             dirty.zones[index] = true;
             dirty.zones[3] = true;
+        }
+
+        idle.tick(Instant::now(), lights.any_on());
+        if idle.dark() != dark {
+            dark = idle.dark();
+            deck.set_brightness(if dark { 0 } else { brightness })?;
         }
 
         paint(&deck, &renderer, &lights, &media, &modes, &mut dirty)?;
