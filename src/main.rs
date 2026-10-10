@@ -70,6 +70,12 @@ fn main() {
                 .help("Lights to control"),
         )
         .arg(
+            Arg::new("preview")
+                .long("preview")
+                .value_name("DIR")
+                .help("Render the keys and LCD zones to PNG files and exit"),
+        )
+        .arg(
             Arg::new("verbose")
                 .long("verbose")
                 .short('v')
@@ -85,6 +91,8 @@ fn main() {
 
     let result = if listing {
         list()
+    } else if let Some(directory) = matches.get_one::<String>("preview") {
+        preview(config, directory)
     } else {
         run(config, brightness, verbose)
     };
@@ -124,6 +132,37 @@ fn configured(config: Option<PathBuf>) -> Result<Vec<LightConfig>, Box<dyn Error
         .or_else(config::default_path)
         .ok_or("HOME is not set; give the lights file with --config")?;
     config::load(&path)
+}
+
+/// Draw every surface to PNG without needing the hardware.
+fn preview(config: Option<PathBuf>, directory: &str) -> Result<(), Box<dyn Error>> {
+    use image::{GenericImage, RgbImage};
+
+    let configs = configured(config)?;
+    std::fs::create_dir_all(directory)?;
+
+    let renderer = Renderer::new()?;
+    let lights = find(configs);
+    let modes = [Dial::Brightness, Dial::Temperature, Dial::Brightness, Dial::Temperature];
+
+    let status = media::Status { present: true, playing: true, muted: true };
+
+    let mut sheet = RgbImage::new(render::KEY * 4, render::KEY * 2);
+    for key in 0..8u32 {
+        let image = key_image(&renderer, &lights, &status, key as usize);
+        sheet.copy_from(&image.to_rgb8(), (key % 4) * render::KEY, (key / 4) * render::KEY)?;
+    }
+    sheet.save(format!("{}/keys.png", directory))?;
+
+    let mut strip = RgbImage::new(render::ZONE_WIDTH * 4, render::ZONE_HEIGHT);
+    for zone in 0..4usize {
+        let image = zone_image(&renderer, &lights, &modes, zone);
+        strip.copy_from(&image.to_rgb8(), zone as u32 * render::ZONE_WIDTH, 0)?;
+    }
+    strip.save(format!("{}/lcd.png", directory))?;
+
+    println!("wrote {}/keys.png and {}/lcd.png", directory, directory);
+    Ok(())
 }
 
 fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box<dyn Error>> {
