@@ -1,0 +1,4 @@
+# Elgato Stream Deck. Without this the hidraw node is root-only and `decker`
+# cannot open the device. uaccess grants an ACL to the active local seat.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
