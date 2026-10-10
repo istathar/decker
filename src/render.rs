@@ -125,7 +125,8 @@ impl Renderer {
     /// A preset in the picker: its name over a bulb glowing the colour and
     /// intensity the preset sets, or unlit if it only turns lights off.
     pub fn preset_key(&self, preset: &Preset) -> DynamicImage {
-        let mut canvas = RgbImage::from_pixel(KEY, KEY, image::Rgb(BACKGROUND));
+        let behind = preset.colour.unwrap_or(BACKGROUND);
+        let mut canvas = RgbImage::from_pixel(KEY, KEY, image::Rgb(behind));
 
         let mut size = 19.0;
         while size > 11.0 && self.width(&preset.name, size) > (KEY - 10) as f32 {
@@ -139,7 +140,7 @@ impl Renderer {
             mix(BACKGROUND, colour, level)
         });
         // Outline and base in the same grey as the light keys' icons.
-        bulb(&mut canvas, 60, 60, glass, FAINT, BACKGROUND);
+        bulb(&mut canvas, 60, 60, glass, FAINT, behind);
 
         DynamicImage::ImageRgb8(canvas)
     }
@@ -637,20 +638,25 @@ mod tests {
     }
 
     #[test]
-    fn preset_key_lights_its_bulb() {
+    fn preset_key_background_follows_colour() {
         let renderer = renderer();
         let setting = config::Setting { on: true, brightness: Some(50), temperature: Some(200) };
-        let mut preset = Preset { name: "Work".into(), settings: vec![("Key".into(), setting)] };
+        let mut preset = Preset { name: "Work".into(), settings: vec![("Key".into(), setting)], colour: None };
 
-        let lit = rgb(&renderer.preset_key(&preset));
-        assert_ne!(at(&lit, 60, 60), BACKGROUND);
-        assert_eq!(at(&lit, 35, 80), BACKGROUND);
+        let plain = rgb(&renderer.preset_key(&preset));
+        assert_eq!(at(&plain, 35, 80), BACKGROUND);
 
-        // A preset that only turns lights off shows a hollow, unlit bulb.
+        preset.colour = Some(RED);
+        let coloured = rgb(&renderer.preset_key(&preset));
+        assert_eq!(at(&coloured, 35, 80), RED);
+        assert_eq!(at(&coloured, 0, 0), RED);
+        assert_eq!(at(&coloured, 119, 119), RED);
+        assert_eq!(at(&coloured, 60, 60), at(&plain, 60, 60), "the bulb is drawn over it");
+
+        // An unlit bulb is hollow, showing the key's colour through it.
         preset.settings[0].1 = config::Setting { on: false, brightness: None, temperature: None };
         let unlit = rgb(&renderer.preset_key(&preset));
-        assert_eq!(at(&unlit, 60, 60), BACKGROUND);
-        assert_eq!(at(&unlit, 60, 43), FAINT);
+        assert_eq!(at(&unlit, 60, 60), RED);
     }
 
     #[test]

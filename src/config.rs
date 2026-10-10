@@ -40,6 +40,8 @@ pub struct Preset {
     pub name: String,
     /// By light name. A light not listed is left as it is.
     pub settings: Vec<(String, Setting)>,
+    /// Fills its key in the picker, if given.
+    pub colour: Option<[u8; 3]>,
 }
 
 impl Preset {
@@ -154,7 +156,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 if presets.iter().any(|section| section.name == preset) {
                     return Err(format!("line {}: [preset {}] appears twice", number, preset));
                 }
-                presets.push(PresetSection { name: preset.to_string(), line: number, settings: Vec::new() });
+                presets.push(PresetSection { name: preset.to_string(), line: number, settings: Vec::new(), colour: None });
                 in_preset = true;
                 continue;
             }
@@ -181,6 +183,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
         if in_preset {
             let preset = presets.last_mut().expect("in_preset follows a preset header");
+            if key == "colour" || key == "color" {
+                let rgb = colour(value).ok_or_else(|| {
+                    format!("line {}: colour is one of {} or #rrggbb, not {}", number, PALETTE_NAMES, value)
+                })?;
+                set(&mut preset.colour, rgb, number, key)?;
+                continue;
+            }
             if preset.settings.iter().any(|(light, _, _)| light == key) {
                 return Err(format!("line {}: {} given twice", number, key));
             }
@@ -235,6 +244,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         finished.push(Preset {
             name: preset.name,
             settings: preset.settings.into_iter().map(|(light, setting, _)| (light, setting)).collect(),
+            colour: preset.colour,
         });
     }
 
@@ -246,6 +256,38 @@ struct PresetSection {
     name: String,
     line: usize,
     settings: Vec<(String, Setting, usize)>,
+    colour: Option<[u8; 3]>,
+}
+
+/// Background colours for preset keys: dark enough that the white name stays
+/// readable and a glowing bulb stands out.
+const PALETTE: [(&str, [u8; 3]); 8] = [
+    ("blue", [0x3a, 0x67, 0xa1]),
+    ("green", [0x3d, 0x8b, 0x5a]),
+    ("purple", [0x75, 0x4f, 0x9f]),
+    ("grey", [0x3c, 0x3f, 0x47]),
+    ("brown", [0x8b, 0x67, 0x46]),
+    ("red", [0x9f, 0x42, 0x42]),
+    ("orange", [0xb3, 0x6e, 0x2c]),
+    ("teal", [0x2f, 0x8b, 0x8b]),
+];
+
+const PALETTE_NAMES: &str = "blue, green, purple, grey, brown, red, orange, teal";
+
+/// A palette name (gray as well as grey), or #rrggbb.
+fn colour(value: &str) -> Option<[u8; 3]> {
+    let value = value.to_lowercase();
+    let value = if value == "gray" { "grey".to_string() } else { value };
+    if let Some((_, rgb)) = PALETTE.iter().find(|(name, _)| *name == value) {
+        return Some(*rgb);
+    }
+
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some([channel(0)?, channel(2)?, channel(4)?])
 }
 
 /// `off`, or `on` and/or a brightness like `40%` and a temperature, either in
@@ -497,10 +539,12 @@ mod tests {
                         ("Key".into(), on(Some(57), Some(192))),
                         ("MK.2".into(), on(Some(20), Some(229))),
                     ],
+                    colour: None,
                 },
                 Preset {
                     name: "Soft".into(),
                     settings: vec![("Air".into(), on(Some(14), Some(344))), ("MK.2".into(), OFF)],
+                    colour: None,
                 },
             ]
         );
@@ -572,6 +616,32 @@ mod tests {
         fails(&format!("{}{}", LIGHTS, nine), "9 presets configured, but there is only room for 8");
         let eight: String = (1..=8).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
         assert_eq!(parse(&format!("{}{}", LIGHTS, eight)).unwrap().presets.len(), 8);
+    }
+
+    #[test]
+    fn presets_take_a_colour() {
+        let text = format!("{}[preset A]\ncolour = Blue\nKey = on\n[preset B]\nKey = off\ncolor = #a0B1c2\n", LIGHTS);
+        let config = parse(&text).unwrap();
+        assert_eq!(config.presets[0].colour, Some([0x3a, 0x67, 0xa1]));
+        assert_eq!(config.presets[0].settings.len(), 1);
+        assert_eq!(config.presets[1].colour, Some([0xa0, 0xb1, 0xc2]));
+    }
+
+    #[test]
+    fn colour_forms() {
+        assert_eq!(colour("grey"), colour("gray"));
+        assert_eq!(colour("GREEN"), Some([0x3d, 0x8b, 0x5a]));
+        assert_eq!(colour("#000000"), Some([0, 0, 0]));
+        for wrong in ["pink", "#12345", "#1234567", "#12345g", "123456", ""] {
+            assert_eq!(colour(wrong), None, "{:?}", wrong);
+        }
+    }
+
+    #[test]
+    fn parse_rejects_colour_mistakes() {
+        fails(&format!("{}[preset A]\ncolour = pink\nKey = on\n", LIGHTS), "line 8: colour is one of blue");
+        fails(&format!("{}[preset A]\ncolour = blue\ncolour = red\nKey = on\n", LIGHTS), "line 9: colour given twice");
+        fails(&format!("{}[preset A]\ncolour = blue\n", LIGHTS), "[preset A] sets no lights");
     }
 
     #[test]

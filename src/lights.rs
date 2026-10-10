@@ -656,6 +656,7 @@ mod tests {
                 ("Air".into(), Setting { on: true, brightness: Some(14), temperature: Some(344) }),
                 ("MK.2".into(), Setting { on: false, brightness: None, temperature: None }),
             ],
+            colour: None,
         };
         lights.recall(&soft);
 

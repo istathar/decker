@@ -27,24 +27,30 @@ shape = air
 #   on, 40%, 213 or 4700K    turn it on; give brightness and/or temperature
 #                            (mireds like the Elgato API, or Kelvin) to set them
 #
-# A light a preset doesn't mention is left as it is.
+# A light a preset doesn't mention is left as it is. `colour` fills the
+# preset's key with blue, green, purple, grey, brown, red, orange, teal, or
+# #rrggbb.
 
 [preset Work]
+colour = blue
 MK.2 = 2% 310
 Key = 2% 310
 Air = 3% 295
 
 [preset Soft]
+colour = purple
 MK.2 = off
 Key = off
 Air = 14% 344
 
 [preset Read]
+colour = green
 MK.2 = 8% 265
 Key = 5% 300
 Air = 25% 192
 
 [preset Full]
+colour = grey
 MK.2 = 20% 229
 Key = 57% 192
 Air = 57% 192
