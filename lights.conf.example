@@ -1,5 +1,6 @@
 # Copy to ~/.config/decker/lights.conf. One section per light, in order left
-# to right across the deck, at most three.
+# to right across the deck, to a maximum of three lights. The option
+# `decker --discover` prints sections for the lights it can find.
 #
 #   id     MAC address; the light is found over mDNS wherever it is
 #   host   fixed address, used until (or unless) the light is found by id

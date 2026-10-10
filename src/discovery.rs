@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -6,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use mdns_sd::{ResolvedService, ServiceDaemon, ServiceEvent};
 
-use crate::config;
+use crate::config::{self, Shape};
 
 /// What Elgato lights advertise themselves as.
 const SERVICE: &str = "_elg._tcp.local.";
@@ -22,6 +23,16 @@ pub struct Found {
     pub model: String,
     /// IPv4 addresses in ascending order; never empty.
     pub addresses: Vec<SocketAddr>,
+}
+
+impl Found {
+    pub fn shape(&self) -> Shape {
+        if self.model.split_whitespace().any(|word| word.eq_ignore_ascii_case("air")) {
+            Shape::Air
+        } else {
+            Shape::Panel
+        }
+    }
 }
 
 /// Where each light was last seen, by MAC address. Kept current by a
@@ -95,6 +106,51 @@ impl Directory {
             thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// Listen for `period`, then return every light that advertised itself,
+/// sorted by name.
+pub fn browse(period: Duration) -> Result<Vec<Found>, Box<dyn Error>> {
+    let daemon = ServiceDaemon::new()?;
+    let events = daemon.browse(SERVICE)?;
+    let deadline = Instant::now() + period;
+    let mut lights: Vec<Found> = Vec::new();
+
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        match events.recv_timeout(remaining) {
+            Ok(ServiceEvent::ServiceResolved(service)) => {
+                if let Some(found) = found(&service) {
+                    lights.retain(|light| light.id != found.id);
+                    lights.push(found);
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    let _ = daemon.shutdown();
+    lights.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(lights)
+}
+
+/// A lights.conf section for a found light. The name is the end of the
+/// advertised one, e.g. "5301", to be replaced by something more useful.
+pub fn section(found: &Found) -> String {
+    let name = found.name.rsplit(' ').next().unwrap_or(&found.name);
+    let shape = match found.shape() {
+        Shape::Panel => "panel",
+        Shape::Air => "air",
+    };
+
+    format!(
+        "# {} at {}\n[{}]\nid = {}\nshape = {}\n\n",
+        if found.model.is_empty() { &found.name } else { &found.model },
+        found.addresses[0].ip(),
+        name,
+        found.id,
+        shape
+    )
 }
 
 fn found(service: &ResolvedService) -> Option<Found> {
@@ -193,6 +249,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(found, light(MAC, &[97]));
+        assert_eq!(found.shape(), Shape::Panel);
     }
 
     #[test]
@@ -209,6 +266,34 @@ mod tests {
         assert_eq!(found.addresses, [SocketAddr::from((ip(12), 9999)), SocketAddr::from((ip(97), 9999))]);
         assert_eq!(found.name, "odd name");
         assert_eq!(found.model, "");
+    }
+
+    #[test]
+    fn shape_follows_the_model() {
+        let mut found = light(MAC, &[97]);
+        found.model = "Elgato Key Light Air 20LAX9901".into();
+        assert_eq!(found.shape(), Shape::Air);
+        found.model = "Elgato Key Light MK.2 20GBJ9901".into();
+        assert_eq!(found.shape(), Shape::Panel);
+        found.model = "Elgato Key Light Mini".into();
+        assert_eq!(found.shape(), Shape::Panel);
+    }
+
+    #[test]
+    fn section_is_valid_configuration() {
+        let mut found = light(MAC, &[97, 98]);
+        assert_eq!(
+            section(&found),
+            "# Elgato Key Light 20GAK9901 at 192.0.2.97\n[5301]\nid = 00:00:5E:00:53:01\nshape = panel\n\n"
+        );
+
+        found.model = "Elgato Key Light Air 20LAX9901".into();
+        let parsed = config::parse(&section(&found)).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "5301");
+        assert_eq!(parsed[0].id.as_deref(), Some(MAC));
+        assert_eq!(parsed[0].host, None);
+        assert_eq!(parsed[0].shape, Shape::Air);
     }
 
     #[test]

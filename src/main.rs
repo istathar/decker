@@ -55,6 +55,12 @@ fn main() {
                 .help("List attached Stream Deck devices and exit"),
         )
         .arg(
+            Arg::new("discover")
+                .long("discover")
+                .action(ArgAction::SetTrue)
+                .help("Look for Key Lights on the network, print them as configuration, and exit"),
+        )
+        .arg(
             Arg::new("brightness")
                 .long("brightness")
                 .short('b')
@@ -87,12 +93,15 @@ fn main() {
         .get_matches();
 
     let listing = *matches.get_one::<bool>("list").unwrap();
+    let discovering = *matches.get_one::<bool>("discover").unwrap();
     let brightness = *matches.get_one::<u8>("brightness").unwrap();
     let verbose = *matches.get_one::<bool>("verbose").unwrap();
     let config = matches.get_one::<String>("config").map(PathBuf::from);
 
     let result = if listing {
         list()
+    } else if discovering {
+        discover()
     } else if let Some(directory) = matches.get_one::<String>("preview") {
         preview(config, directory)
     } else {
@@ -117,6 +126,22 @@ fn list() -> Result<(), Box<dyn Error>> {
 
     for (kind, serial) in devices {
         println!("{:?}  serial {}  keys {}  dials {}", kind, serial, kind.key_count(), kind.encoder_count());
+    }
+
+    Ok(())
+}
+
+/// Print the lights that answer over mDNS, ready to paste into lights.conf.
+fn discover() -> Result<(), Box<dyn Error>> {
+    let period = Duration::from_secs(10);
+    eprintln!("decker: listening for Key Lights for {} s", period.as_secs());
+
+    let found = discovery::browse(period)?;
+    if found.is_empty() {
+        eprintln!("decker: none answered");
+    }
+    for light in &found {
+        print!("{}", discovery::section(light));
     }
 
     Ok(())
