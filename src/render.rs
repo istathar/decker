@@ -5,6 +5,7 @@ use image::{DynamicImage, RgbImage};
 
 use crate::config::{self, Shape};
 use crate::lights::State;
+use crate::media::Status;
 use crate::Dial;
 
 pub const KEY: u32 = 120;
@@ -51,6 +52,46 @@ impl Renderer {
             }
         }
         Err("no usable font found; install dejavu-sans-fonts".into())
+    }
+
+    pub fn media_key(&self, index: u8, status: &Status) -> DynamicImage {
+        let mut canvas = RgbImage::from_pixel(KEY, KEY, image::Rgb(BACKGROUND));
+        let live = status.present;
+        let ink = if live { TEXT } else { DEAD };
+
+        match index {
+            0 => {
+                bar(&mut canvas, 36, 38, 7, 44, ink);
+                triangle(&mut canvas, 84, 38, -38, 44, ink);
+            }
+            1 => {
+                let colour = if live { ACCENT } else { DEAD };
+                if status.playing {
+                    bar(&mut canvas, 42, 36, 11, 48, colour);
+                    bar(&mut canvas, 67, 36, 11, 48, colour);
+                } else {
+                    triangle(&mut canvas, 44, 36, 36, 48, colour);
+                }
+            }
+            2 => {
+                triangle(&mut canvas, 36, 38, 38, 44, ink);
+                bar(&mut canvas, 77, 38, 7, 44, ink);
+            }
+            _ => {
+                let colour = if status.muted { FAINT } else { TEXT };
+                // Body runs 2 px under the cone so only its left corners show.
+                panel(&mut canvas, 41.5, 60.0, 14.0, 17.0, 3.0, 0.0, colour);
+                cone(&mut canvas, 46, 60, 16, 9, 25, colour);
+                if status.muted {
+                    stroke(&mut canvas, 33, 38, 75, 82, 6, RED);
+                } else {
+                    arc(&mut canvas, 58, 60, 13, 5, 0.85, colour);
+                    arc(&mut canvas, 58, 60, 24, 5, 0.85, colour);
+                }
+            }
+        }
+
+        DynamicImage::ImageRgb8(canvas)
     }
 
     pub fn light_key(&self, name: &str, shape: Shape, state: &State, online: bool) -> DynamicImage {
@@ -191,6 +232,19 @@ fn bar(canvas: &mut RgbImage, x: i32, y: i32, width: i32, height: i32, colour: [
     }
 }
 
+/// Positive width points right, negative points left from x.
+fn triangle(canvas: &mut RgbImage, x: i32, y: i32, width: i32, height: i32, colour: [u8; 3]) {
+    let span = width.abs();
+    for row in 0..height {
+        let distance = (row - height / 2).abs() as f32 / (height as f32 / 2.0);
+        let length = ((1.0 - distance) * span as f32).round() as i32;
+        for column in 0..length {
+            let px = if width >= 0 { x + column } else { x - column };
+            blend(canvas, px, y + row, colour, 255);
+        }
+    }
+}
+
 /// Rounded rectangle, antialiased at the corners.
 fn rounded(canvas: &mut RgbImage, x: i32, y: i32, width: i32, height: i32, radius: i32, colour: [u8; 3]) {
     let radius = radius.min(width / 2).min(height / 2).max(1) as f32;
@@ -261,6 +315,28 @@ fn keylight(canvas: &mut RgbImage, cx: i32, cy: i32, shape: Shape, colour: [u8; 
     );
 }
 
+/// Sound wave: part of a ring, opening to the right, `spread` radians either
+/// side of horizontal.
+fn arc(canvas: &mut RgbImage, cx: i32, cy: i32, radius: i32, thickness: i32, spread: f32, colour: [u8; 3]) {
+    let outer = radius + thickness;
+    let half = thickness as f32 / 2.0;
+
+    for row in -outer..=outer {
+        for column in 0..=outer {
+            let dx = column as f32;
+            let dy = row as f32;
+            if dy.atan2(dx).abs() > spread {
+                continue;
+            }
+            let distance = (dx * dx + dy * dy).sqrt();
+            let coverage = (half + 0.5 - (distance - radius as f32).abs()).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend(canvas, cx + column, cy + row, colour, (coverage * 255.0) as u8);
+            }
+        }
+    }
+}
+
 /// IEC 5009 standby mark: broken ring with a bar through the gap.
 fn power(canvas: &mut RgbImage, cx: i32, cy: i32, radius: i32, thickness: i32, colour: [u8; 3]) {
     let outer = radius + thickness;
@@ -286,6 +362,27 @@ fn power(canvas: &mut RgbImage, cx: i32, cy: i32, radius: i32, thickness: i32, c
     let top = cy - radius - thickness - 3;
     let length = cy - (radius as f32 * 0.10) as i32 - top;
     rounded(canvas, cx - thickness / 2, top, thickness, length, thickness / 2, colour);
+}
+
+/// Speaker cone: flares from `near` to `far` half-height across `width`.
+fn cone(canvas: &mut RgbImage, x: i32, centre: i32, width: i32, near: i32, far: i32, colour: [u8; 3]) {
+    for column in 0..width {
+        let t = column as f32 / (width - 1).max(1) as f32;
+        let half = (near as f32 + (far - near) as f32 * t).round() as i32;
+        for row in -half..=half {
+            blend(canvas, x + column, centre + row, colour, 255);
+        }
+    }
+}
+
+fn stroke(canvas: &mut RgbImage, x0: i32, y0: i32, x1: i32, y1: i32, weight: i32, colour: [u8; 3]) {
+    let steps = (x1 - x0).abs().max((y1 - y0).abs()).max(1);
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let x = x0 + ((x1 - x0) as f32 * t).round() as i32;
+        let y = y0 + ((y1 - y0) as f32 * t).round() as i32;
+        bar(canvas, x - weight / 2, y - weight / 2, weight, weight, colour);
+    }
 }
 
 /// Where a temperature sits between the warmest and coolest a light can do,
@@ -368,6 +465,23 @@ mod tests {
     }
 
     #[test]
+    fn triangle_points_by_sign_of_width() {
+        let mut right = blank();
+        triangle(&mut right, 2, 2, 10, 10, RED);
+        assert_eq!(at(&right, 2, 7), RED);
+        assert_eq!(at(&right, 10, 7), RED);
+        assert_eq!(at(&right, 1, 7), BACKGROUND);
+
+        let mut left = blank();
+        triangle(&mut left, 17, 2, -10, 10, RED);
+        assert_eq!(at(&left, 17, 7), RED);
+        assert_eq!(at(&left, 9, 7), RED);
+        assert_eq!(at(&left, 18, 7), BACKGROUND);
+
+        assert_eq!(count(&right, RED), count(&left, RED));
+    }
+
+    #[test]
     fn rounded_softens_corners_only() {
         let mut canvas = blank();
         rounded(&mut canvas, 0, 0, 20, 20, 6, RED);
@@ -400,6 +514,11 @@ mod tests {
     #[test]
     fn surfaces_have_hardware_dimensions() {
         let renderer = renderer();
+        let status = Status { present: true, playing: false, muted: false };
+        for index in 0..4 {
+            let image = renderer.media_key(index, &status);
+            assert_eq!((image.width(), image.height()), (KEY, KEY));
+        }
         let image = renderer.light_key("Key", Shape::Panel, &ON, true);
         assert_eq!((image.width(), image.height()), (KEY, KEY));
         let image = renderer.all_key(true);
@@ -419,6 +538,58 @@ mod tests {
         let zone = rgb(&renderer.empty_zone());
         assert_eq!((zone.width(), zone.height()), (ZONE_WIDTH, ZONE_HEIGHT));
         assert!(zone.pixels().all(|pixel| pixel.0 == GUTTER || pixel.0 == PANEL));
+    }
+
+    #[test]
+    fn play_key_shows_state() {
+        let renderer = renderer();
+        let playing = rgb(&renderer.media_key(1, &Status { present: true, playing: true, muted: false }));
+        let paused = rgb(&renderer.media_key(1, &Status { present: true, playing: false, muted: false }));
+        let absent = rgb(&renderer.media_key(1, &Status { present: false, playing: false, muted: false }));
+
+        assert_ne!(playing, paused);
+        // The gap between the two pause bars.
+        assert_eq!(at(&playing, 60, 60), BACKGROUND);
+        assert_eq!(at(&paused, 60, 60), ACCENT);
+        assert_eq!(count(&absent, ACCENT), 0);
+        assert!(count(&absent, DEAD) > 0);
+    }
+
+    #[test]
+    fn transport_keys_dim_without_a_player() {
+        let renderer = renderer();
+        let present = Status { present: true, playing: false, muted: false };
+        let absent = Status::default();
+        for index in [0, 2] {
+            assert!(count(&rgb(&renderer.media_key(index, &present)), TEXT) > 0);
+            assert_eq!(count(&rgb(&renderer.media_key(index, &absent)), TEXT), 0);
+        }
+    }
+
+    #[test]
+    fn previous_and_next_carry_the_same_ink() {
+        let renderer = renderer();
+        let status = Status { present: true, playing: false, muted: false };
+        let previous = rgb(&renderer.media_key(0, &status));
+        let next = rgb(&renderer.media_key(2, &status));
+        assert_eq!(count(&previous, TEXT), count(&next, TEXT));
+        assert_eq!(at(&previous, 38, 60), TEXT);
+        assert_eq!(at(&next, 80, 60), TEXT);
+    }
+
+    #[test]
+    fn mute_key_is_struck_through_when_muted() {
+        let renderer = renderer();
+        let loud = rgb(&renderer.media_key(3, &Status { present: false, playing: false, muted: false }));
+        let muted = rgb(&renderer.media_key(3, &Status { present: false, playing: false, muted: true }));
+        assert_eq!(count(&loud, RED), 0);
+        assert!(count(&muted, RED) > 0);
+        assert!(count(&loud, TEXT) > count(&muted, TEXT));
+
+        // Sound waves only when there is sound: on the inner arc's line.
+        assert_eq!(at(&loud, 71, 60), TEXT);
+        assert_eq!(at(&loud, 82, 60), TEXT);
+        assert_eq!(at(&muted, 82, 60), BACKGROUND);
     }
 
     #[test]

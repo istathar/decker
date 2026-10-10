@@ -1,5 +1,6 @@
 mod config;
 mod lights;
+mod media;
 mod render;
 
 use std::error::Error;
@@ -15,6 +16,7 @@ use image::DynamicImage;
 
 use config::{LightConfig, BRIGHTNESS_STEP, TEMPERATURE_STEP};
 use lights::Lights;
+use media::{Action, Media};
 use render::Renderer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -139,6 +141,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
 
     let renderer = Renderer::new()?;
     let mut lights = find(configs);
+    let media = Media::start();
     let mut modes = [Dial::Brightness; 4];
 
     println!("decker: {:?} serial {}, firmware {}", kind, serial, deck.firmware_version()?);
@@ -152,6 +155,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     }
 
     let mut dirty = Dirty::all();
+    let mut generation = media.generation();
 
     let deck = std::sync::Arc::new(deck);
     let reader = deck.get_reader();
@@ -164,6 +168,10 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
 
             match update {
                 DeviceStateUpdate::ButtonDown(key) => match key {
+                    0 => media.send(Action::Previous),
+                    1 => media.send(Action::PlayPause),
+                    2 => media.send(Action::Next),
+                    3 => media.send(Action::ToggleMute),
                     4..=6 => {
                         let index = (key - 4) as usize;
                         if let Some(light) = lights.items.get_mut(index) {
@@ -217,6 +225,13 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             }
         }
 
+        let latest = media.generation();
+        if latest != generation {
+            generation = latest;
+            dirty.keys[1] = true;
+            dirty.keys[3] = true;
+        }
+
         for index in lights.poll() {
             dirty.keys[index + 4] = true;
             dirty.keys[7] = true;
@@ -224,7 +239,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             dirty.zones[3] = true;
         }
 
-        paint(&deck, &renderer, &lights, &modes, &mut dirty)?;
+        paint(&deck, &renderer, &lights, &media, &modes, &mut dirty)?;
     }
 }
 
@@ -240,9 +255,11 @@ fn paint(
     deck: &StreamDeck,
     renderer: &Renderer,
     lights: &Lights,
+    media: &Media,
     modes: &[Dial; 4],
     dirty: &mut Dirty,
 ) -> Result<(), Box<dyn Error>> {
+    let status = media.status();
     let mut flush = false;
 
     for key in 0..8usize {
@@ -252,7 +269,7 @@ fn paint(
         dirty.keys[key] = false;
         flush = true;
 
-        let image = key_image(renderer, lights, key);
+        let image = key_image(renderer, lights, &status, key);
         deck.set_button_image(key as u8, image)?;
     }
 
@@ -286,9 +303,9 @@ impl Dirty {
     }
 }
 
-fn key_image(renderer: &Renderer, lights: &Lights, key: usize) -> DynamicImage {
+fn key_image(renderer: &Renderer, lights: &Lights, status: &media::Status, key: usize) -> DynamicImage {
     match key {
-        0..=3 => renderer.empty_key(),
+        0..=3 => renderer.media_key(key as u8, status),
         4..=6 => match lights.items.get(key - 4) {
             Some(light) => renderer.light_key(light.name(), light.config.shape, &light.state, light.online()),
             None => renderer.empty_key(),
