@@ -6,6 +6,16 @@ use std::time::Duration;
 pub struct LightConfig {
     pub name: String,
     pub host: String,
+    pub shape: Shape,
+}
+
+/// The two Key Light body styles, drawn on the keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// Key Light and MK.2: wide, with strongly rounded ends.
+    Panel,
+    /// Key Light Air: nearly square.
+    Air,
 }
 
 /// Lights go on keys 4-6 and dials 0-2.
@@ -33,6 +43,11 @@ pub const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 /// re-read, in case something else changed it.
 pub const RESYNC: Duration = Duration::from_secs(30);
 
+pub fn kelvin(mired: i32) -> i32 {
+    let mired = mired.clamp(TEMPERATURE_MIN, TEMPERATURE_MAX);
+    (1_000_000 / mired / 50) * 50
+}
+
 /// $XDG_CONFIG_HOME/decker/lights.conf, falling back to ~/.config.
 pub fn default_path() -> Option<PathBuf> {
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
@@ -54,6 +69,7 @@ pub fn load(path: &Path) -> Result<Vec<LightConfig>, Box<dyn Error>> {
 /// ```text
 /// [Key]
 /// host = 192.0.2.20
+/// shape = panel
 /// ```
 ///
 /// Blank lines and lines starting with `#` or `;` are ignored.
@@ -78,7 +94,7 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
             if sections.iter().any(|section| section.name == name) {
                 return Err(format!("line {}: [{}] appears twice", number, name));
             }
-            sections.push(Section { name: name.to_string(), line: number, host: None });
+            sections.push(Section { name: name.to_string(), line: number, host: None, shape: None });
             continue;
         }
 
@@ -97,6 +113,14 @@ pub fn parse(text: &str) -> Result<Vec<LightConfig>, String> {
 
         match key {
             "host" => set(&mut section.host, value.to_string(), number, key)?,
+            "shape" => {
+                let shape = match value.to_lowercase().as_str() {
+                    "panel" => Shape::Panel,
+                    "air" => Shape::Air,
+                    _ => return Err(format!("line {}: shape is panel or air, not {}", number, value)),
+                };
+                set(&mut section.shape, shape, number, key)?
+            }
             _ => return Err(format!("line {}: unknown setting {}", number, key)),
         }
     }
@@ -114,6 +138,7 @@ struct Section {
     name: String,
     line: usize,
     host: Option<String>,
+    shape: Option<Shape>,
 }
 
 impl Section {
@@ -122,7 +147,7 @@ impl Section {
             .host
             .ok_or_else(|| format!("line {}: [{}] needs a host", self.line, self.name))?;
 
-        Ok(LightConfig { name: self.name, host })
+        Ok(LightConfig { name: self.name, host, shape: self.shape.unwrap_or(Shape::Panel) })
     }
 }
 
@@ -138,8 +163,38 @@ fn set<T>(slot: &mut Option<T>, value: T, number: usize, key: &str) -> Result<()
 mod tests {
     use super::*;
 
-    fn light(name: &str, host: &str) -> LightConfig {
-        LightConfig { name: name.into(), host: host.into() }
+    #[test]
+    fn kelvin_converts_and_rounds_down_to_fifty() {
+        assert_eq!(kelvin(200), 5000);
+        assert_eq!(kelvin(250), 4000);
+        assert_eq!(kelvin(213), 4650);
+    }
+
+    #[test]
+    fn kelvin_spans_the_elgato_range() {
+        assert_eq!(kelvin(TEMPERATURE_MIN), 6950);
+        assert_eq!(kelvin(TEMPERATURE_MAX), 2900);
+    }
+
+    #[test]
+    fn kelvin_clamps_out_of_range_mireds() {
+        assert_eq!(kelvin(0), kelvin(TEMPERATURE_MIN));
+        assert_eq!(kelvin(-5), kelvin(TEMPERATURE_MIN));
+        assert_eq!(kelvin(10_000), kelvin(TEMPERATURE_MAX));
+    }
+
+    #[test]
+    fn fewer_mireds_is_more_kelvin() {
+        let mut previous = i32::MAX;
+        for mired in TEMPERATURE_MIN..=TEMPERATURE_MAX {
+            let k = kelvin(mired);
+            assert!(k <= previous);
+            previous = k;
+        }
+    }
+
+    fn light(name: &str, host: &str, shape: Shape) -> LightConfig {
+        LightConfig { name: name.into(), host: host.into(), shape }
     }
 
     fn fails(text: &str, expected: &str) {
@@ -156,21 +211,22 @@ mod tests {
 
             ; the one by the window
             [Air]
+            shape = air
             host = 192.0.2.81
         ";
         assert_eq!(
             parse(text).unwrap(),
             [
-                light("MK.2", "192.0.2.93"),
-                light("Air", "192.0.2.81"),
+                light("MK.2", "192.0.2.93", Shape::Panel),
+                light("Air", "192.0.2.81", Shape::Air),
             ]
         );
     }
 
     #[test]
-    fn parse_tolerates_spacing() {
-        let text = "[ Key ]\n  host=key.local  \n";
-        assert_eq!(parse(text).unwrap(), [light("Key", "key.local")]);
+    fn parse_tolerates_spacing_and_case() {
+        let text = "[ Key ]\n  host=key.local  \nshape = PANEL\n";
+        assert_eq!(parse(text).unwrap(), [light("Key", "key.local", Shape::Panel)]);
     }
 
     #[test]
@@ -193,6 +249,7 @@ mod tests {
         fails("[Key]\nhost a\n", "line 2: expected setting = value");
         fails("[Key]\nhost =\n", "line 2: host has no value");
         fails("[Key]\nhost = a\nhost = b\n", "line 3: host given twice");
+        fails("[Key]\nhost = a\nshape = round\n", "line 3: shape is panel or air");
         fails("[Key]\nhost = a\ncolour = red\n", "line 3: unknown setting colour");
     }
 

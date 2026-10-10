@@ -1,5 +1,6 @@
 mod config;
 mod lights;
+mod render;
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -7,11 +8,14 @@ use std::time::Duration;
 
 use clap::builder::{OsStr, Resettable};
 use clap::{Arg, ArgAction, Command};
+use elgato_streamdeck::images::ImageRect;
 use elgato_streamdeck::info::Kind;
 use elgato_streamdeck::{list_devices, new_hidapi, DeviceStateUpdate, StreamDeck};
+use image::DynamicImage;
 
 use config::{LightConfig, BRIGHTNESS_STEP, TEMPERATURE_STEP};
 use lights::Lights;
+use render::Renderer;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -133,6 +137,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     deck.reset()?;
     deck.set_brightness(brightness)?;
 
+    let renderer = Renderer::new()?;
     let mut lights = find(configs);
     let mut modes = [Dial::Brightness; 4];
 
@@ -145,6 +150,8 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             if light.online() { "ok" } else { "unreachable" }
         );
     }
+
+    let mut dirty = Dirty::all();
 
     let deck = std::sync::Arc::new(deck);
     let reader = deck.get_reader();
@@ -161,11 +168,16 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
                         let index = (key - 4) as usize;
                         if let Some(light) = lights.items.get_mut(index) {
                             light.toggle();
+                            dirty.keys[key as usize] = true;
+                            dirty.keys[7] = true;
+                            dirty.zones[index] = true;
+                            dirty.zones[3] = true;
                         }
                     }
                     7 => {
                         let wanted = !lights.any_on();
                         lights.set_all(wanted);
+                        dirty = Dirty::all();
                     }
                     _ => {}
                 },
@@ -177,12 +189,16 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
                     if index < 3 {
                         if let Some(light) = lights.items.get_mut(index) {
                             turn(light, modes[index], delta);
+                            dirty.keys[index + 4] = true;
+                            dirty.zones[index] = true;
+                            dirty.zones[3] = true;
                         }
                     } else if index == 3 {
                         match modes[3] {
                             Dial::Brightness => lights.nudge_all_brightness(delta * BRIGHTNESS_STEP),
                             Dial::Temperature => lights.nudge_all_temperature(-delta * TEMPERATURE_STEP),
                         }
+                        dirty = Dirty::all();
                     }
                 }
 
@@ -190,8 +206,10 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
                     let index = dial as usize;
                     if index == 3 {
                         modes = [modes[3].flip(); 4];
+                        dirty.zones = [true; 4];
                     } else if index < 3 {
                         modes[index] = modes[index].flip();
+                        dirty.zones[index] = true;
                     }
                 }
 
@@ -199,8 +217,14 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             }
         }
 
-        // Keep each light's state current with what its worker reports.
-        lights.poll();
+        for index in lights.poll() {
+            dirty.keys[index + 4] = true;
+            dirty.keys[7] = true;
+            dirty.zones[index] = true;
+            dirty.zones[3] = true;
+        }
+
+        paint(&deck, &renderer, &lights, &modes, &mut dirty)?;
     }
 }
 
@@ -212,6 +236,83 @@ fn turn(light: &mut lights::Light, mode: Dial, delta: i32) {
     }
 }
 
+fn paint(
+    deck: &StreamDeck,
+    renderer: &Renderer,
+    lights: &Lights,
+    modes: &[Dial; 4],
+    dirty: &mut Dirty,
+) -> Result<(), Box<dyn Error>> {
+    let mut flush = false;
+
+    for key in 0..8usize {
+        if !dirty.keys[key] {
+            continue;
+        }
+        dirty.keys[key] = false;
+        flush = true;
+
+        let image = key_image(renderer, lights, key);
+        deck.set_button_image(key as u8, image)?;
+    }
+
+    if flush {
+        deck.flush()?;
+    }
+
+    for zone in 0..4usize {
+        if !dirty.zones[zone] {
+            continue;
+        }
+        dirty.zones[zone] = false;
+
+        let image = zone_image(renderer, lights, modes, zone);
+        let x = (zone as u32 * render::ZONE_WIDTH) as u16;
+        deck.write_lcd(x, 0, &ImageRect::from_image(image)?)?;
+    }
+
+    Ok(())
+}
+
+/// Which keys and LCD zones need drawing again.
+struct Dirty {
+    keys: [bool; 8],
+    zones: [bool; 4],
+}
+
+impl Dirty {
+    fn all() -> Self {
+        Dirty { keys: [true; 8], zones: [true; 4] }
+    }
+}
+
+fn key_image(renderer: &Renderer, lights: &Lights, key: usize) -> DynamicImage {
+    match key {
+        0..=3 => renderer.empty_key(),
+        4..=6 => match lights.items.get(key - 4) {
+            Some(light) => renderer.light_key(light.name(), light.config.shape, &light.state, light.online()),
+            None => renderer.empty_key(),
+        },
+        _ => renderer.all_key(lights.any_on()),
+    }
+}
+
+fn zone_image(renderer: &Renderer, lights: &Lights, modes: &[Dial; 4], zone: usize) -> DynamicImage {
+    if zone == 3 {
+        let summary = lights::State {
+            on: lights.any_on(),
+            brightness: lights.mean_brightness(),
+            temperature: lights.mean_temperature(),
+        };
+        return renderer.zone("ALL", modes[3], summary, true);
+    }
+
+    match lights.items.get(zone) {
+        Some(light) => renderer.zone(light.name(), modes[zone], light.state, light.online()),
+        None => renderer.empty_zone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +320,7 @@ mod tests {
 
     fn light() -> Light {
         let state = State { on: true, brightness: 50, temperature: 200 };
-        let config = LightConfig { name: "Key".into(), host: "192.0.2.1".into() };
+        let config = LightConfig { name: "Key".into(), host: "192.0.2.1".into(), shape: config::Shape::Panel };
         Light::detached(config, state).0
     }
 
@@ -242,9 +343,10 @@ mod tests {
     #[test]
     fn clockwise_is_cooler() {
         let mut light = light();
+        let before = config::kelvin(light.state.temperature);
         turn(&mut light, Dial::Temperature, 2);
-        // Fewer mireds is a higher colour temperature.
         assert_eq!(light.state.temperature, 200 - 2 * TEMPERATURE_STEP);
+        assert!(config::kelvin(light.state.temperature) > before);
         assert_eq!(light.state.brightness, 50);
     }
 }

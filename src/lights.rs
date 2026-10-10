@@ -200,6 +200,16 @@ impl Lights {
             light.nudge_temperature(delta);
         }
     }
+
+    pub fn mean_brightness(&self) -> i32 {
+        let total: i32 = self.items.iter().map(|light| light.state.brightness).sum();
+        total / self.items.len().max(1) as i32
+    }
+
+    pub fn mean_temperature(&self) -> i32 {
+        let total: i32 = self.items.iter().map(|light| light.state.temperature).sum();
+        total / self.items.len().max(1) as i32
+    }
 }
 
 fn agent() -> Agent {
@@ -350,7 +360,7 @@ mod tests {
     }
 
     fn sample() -> LightConfig {
-        LightConfig { name: "Key".into(), host: "192.0.2.1".into() }
+        LightConfig { name: "Key".into(), host: "192.0.2.1".into(), shape: config::Shape::Panel }
     }
 
     fn sent(receiver: &Receiver<Change>) -> Vec<State> {
@@ -431,6 +441,25 @@ mod tests {
         light.nudge_temperature(4);
         assert!(!light.state.on);
         assert!(sent(&receiver).iter().all(|state| !state.on));
+    }
+
+    #[test]
+    fn group_summaries() {
+        let (lights, _receivers) = group(&[lit(10, 150), State { on: false, brightness: 20, temperature: 250 }, lit(60, 341)]);
+        assert!(lights.any_on());
+        assert_eq!(lights.mean_brightness(), 30);
+        assert_eq!(lights.mean_temperature(), 247);
+
+        let (dark, _receivers) = group(&[State::default(); 3]);
+        assert!(!dark.any_on());
+    }
+
+    #[test]
+    fn empty_group_does_not_divide_by_zero() {
+        let (lights, _receivers) = group(&[]);
+        assert_eq!(lights.mean_brightness(), 0);
+        assert_eq!(lights.mean_temperature(), 0);
+        assert!(!lights.any_on());
     }
 
     #[test]
