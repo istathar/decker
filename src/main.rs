@@ -180,9 +180,8 @@ fn find(configs: Vec<LightConfig>) -> Lights {
 }
 
 fn configured(config: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
-    let path = config
-        .or_else(config::default_path)
-        .ok_or("HOME is not set; give the lights file with --config")?;
+    // Only None when there is no default, i.e. no $HOME.
+    let path = config.ok_or("HOME is not set; give the lights file with --config")?;
     config::load(&path)
 }
 
