@@ -6,6 +6,7 @@ mod media;
 mod render;
 
 use std::error::Error;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use clap::builder::{OsStr, Resettable};
 use clap::{Arg, ArgAction, Command};
 use elgato_streamdeck::images::ImageRect;
 use elgato_streamdeck::info::Kind;
-use elgato_streamdeck::{list_devices, new_hidapi, DeviceStateUpdate, StreamDeck};
+use elgato_streamdeck::{list_devices, new_hidapi, refresh_device_list, DeviceStateUpdate, StreamDeck};
 use image::DynamicImage;
 
 use config::{Config, LightConfig, Preset, BRIGHTNESS_STEP, TEMPERATURE_STEP};
@@ -110,11 +111,28 @@ fn main() {
         run(config, brightness, verbose)
     };
 
-    if let Err(problem) = result {
-        eprintln!("decker: {}", problem);
-        std::process::exit(1);
+    match result {
+        Ok(()) => {}
+        Err(problem) if problem.is::<Unplugged>() => println!("decker: {}", problem),
+        Err(problem) => {
+            eprintln!("decker: {}", problem);
+            std::process::exit(1);
+        }
     }
 }
+
+/// The deck went away while running. Under systemd that is how decker
+/// normally stops, so it isn't a failure.
+#[derive(Debug)]
+struct Unplugged;
+
+impl fmt::Display for Unplugged {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("Stream Deck unplugged")
+    }
+}
+
+impl Error for Unplugged {}
 
 fn list() -> Result<(), Box<dyn Error>> {
     let hidapi = new_hidapi()?;
@@ -212,7 +230,7 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     let config = configured(config)?;
     let presets = config.presets;
 
-    let hidapi = new_hidapi()?;
+    let mut hidapi = new_hidapi()?;
     let (kind, serial) = list_devices(&hidapi)
         .into_iter()
         .find(|(kind, _)| matches!(kind, Kind::Plus | Kind::PlusXl))
@@ -247,8 +265,22 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     let deck = std::sync::Arc::new(deck);
     let reader = deck.get_reader();
 
+    // A problem with the deck is Unplugged if it is no longer attached.
+    let mut unplugged = |problem: Box<dyn Error>| -> Box<dyn Error> {
+        let attached = refresh_device_list(&mut hidapi).is_err()
+            || list_devices(&hidapi).iter().any(|(_, attached)| *attached == serial);
+        if attached {
+            problem
+        } else {
+            Box::new(Unplugged)
+        }
+    };
+
     loop {
-        for update in reader.read(Some(Duration::from_millis(100)))? {
+        let updates = reader
+            .read(Some(Duration::from_millis(100)))
+            .map_err(|problem| unplugged(problem.into()))?;
+        for update in updates {
             if verbose {
                 println!("{:?}", update);
             }
@@ -346,10 +378,12 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
         idle.tick(Instant::now(), lights.any_on());
         if idle.dark() != dark {
             dark = idle.dark();
-            deck.set_brightness(if dark { 0 } else { brightness })?;
+            deck.set_brightness(if dark { 0 } else { brightness })
+                .map_err(|problem| unplugged(problem.into()))?;
         }
 
-        paint(&deck, &renderer, &lights, &media, &modes, picking.then_some(&presets[..]), &mut dirty)?;
+        paint(&deck, &renderer, &lights, &media, &modes, picking.then_some(&presets[..]), &mut dirty)
+            .map_err(|problem| unplugged(problem.into()))?;
     }
 }
 

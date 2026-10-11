@@ -1,0 +1,14 @@
+# User unit, started by the udev rule when the Stream Deck Plus is plugged in
+# and stopped when it is unplugged. It needs the session bus for MPRIS,
+# PipeWire for wpctl, and the seat's uaccess ACL on hidraw.
+[Unit]
+Description=Stream Deck Plus control of Key Lights and media
+BindsTo=dev-streamdeckplus.device
+After=dev-streamdeckplus.device pipewire.service wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/decker
+# For a failure while the deck is attached, such as at login before the seat's
+# ACL is in place.
+Restart=on-failure
+RestartSec=5
