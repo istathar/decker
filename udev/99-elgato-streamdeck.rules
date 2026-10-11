@@ -1,0 +1,8 @@
+# Elgato Stream Deck. Without this the hidraw node is root-only and `decker`
+# cannot open the device. uaccess grants an ACL to the active local seat.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0fd9", TAG+="uaccess"
+
+# Stream Deck Plus. Start decker's user unit when it is plugged in, and name the
+# device so the unit can bind to it and be stopped when it is unplugged.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0fd9", ATTRS{idProduct}=="0084", SYMLINK+="streamdeckplus", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="decker.service"

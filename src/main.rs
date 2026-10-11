@@ -1,0 +1,527 @@
+mod config;
+mod discovery;
+mod idle;
+mod lights;
+mod media;
+mod render;
+
+use std::error::Error;
+use std::fmt;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use clap::builder::{OsStr, Resettable};
+use clap::{Arg, ArgAction, Command};
+use elgato_streamdeck::images::ImageRect;
+use elgato_streamdeck::info::Kind;
+use elgato_streamdeck::{list_devices, new_hidapi, refresh_device_list, DeviceStateUpdate, StreamDeck};
+use image::DynamicImage;
+
+use config::{Config, LightConfig, Preset, BRIGHTNESS_STEP, TEMPERATURE_STEP};
+use discovery::Directory;
+use idle::Idle;
+use lights::Lights;
+use media::{Action, Media};
+use render::Renderer;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Dial {
+    Brightness,
+    Temperature,
+}
+
+impl Dial {
+    fn flip(self) -> Self {
+        match self {
+            Dial::Brightness => Dial::Temperature,
+            Dial::Temperature => Dial::Brightness,
+        }
+    }
+}
+
+fn main() {
+    // Shown by --help and used when --config isn't given; none without $HOME.
+    let default_config: Resettable<OsStr> = config::default_path()
+        .map(|path| OsStr::from(path.display().to_string()))
+        .into();
+
+    let matches = Command::new("decker")
+        .version(VERSION)
+        .author("Andrew Cowie")
+        .about("Control Elgato Key Lights and GNOME media playback using a Stream Deck Plus.")
+        .arg(
+            Arg::new("list")
+                .long("list")
+                .action(ArgAction::SetTrue)
+                .help("List attached Stream Deck devices and exit"),
+        )
+        .arg(
+            Arg::new("discover")
+                .long("discover")
+                .action(ArgAction::SetTrue)
+                .help("Look for Key Lights on the network, print them as configuration, and exit"),
+        )
+        .arg(
+            Arg::new("brightness")
+                .long("brightness")
+                .short('b')
+                .value_name("PERCENT")
+                .value_parser(clap::value_parser!(u8).range(5..=100))
+                .default_value("45")
+                .help("Panel brightness of the Stream Deck itself"),
+        )
+        .arg(
+            Arg::new("config")
+                .long("config")
+                .short('c')
+                .value_name("FILE")
+                .default_value(default_config)
+                .help("Lights to control"),
+        )
+        .arg(
+            Arg::new("preview")
+                .long("preview")
+                .value_name("DIR")
+                .help("Render the keys and LCD zones to PNG files and exit"),
+        )
+        .arg(
+            Arg::new("verbose")
+                .long("verbose")
+                .short('v')
+                .action(ArgAction::SetTrue)
+                .help("Print device events as they arrive"),
+        )
+        .get_matches();
+
+    let listing = *matches.get_one::<bool>("list").unwrap();
+    let discovering = *matches.get_one::<bool>("discover").unwrap();
+    let brightness = *matches.get_one::<u8>("brightness").unwrap();
+    let verbose = *matches.get_one::<bool>("verbose").unwrap();
+    let config = matches.get_one::<String>("config").map(PathBuf::from);
+
+    let result = if listing {
+        list()
+    } else if discovering {
+        discover()
+    } else if let Some(directory) = matches.get_one::<String>("preview") {
+        preview(config, directory)
+    } else {
+        run(config, brightness, verbose)
+    };
+
+    match result {
+        Ok(()) => {}
+        Err(problem) if problem.is::<Unplugged>() => println!("decker: {}", problem),
+        Err(problem) => {
+            eprintln!("decker: {}", problem);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The deck went away while running. Under systemd that is how decker
+/// normally stops, so it isn't a failure.
+#[derive(Debug)]
+struct Unplugged;
+
+impl fmt::Display for Unplugged {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("Stream Deck unplugged")
+    }
+}
+
+impl Error for Unplugged {}
+
+fn list() -> Result<(), Box<dyn Error>> {
+    let hidapi = new_hidapi()?;
+    let devices = list_devices(&hidapi);
+
+    if devices.is_empty() {
+        println!("No Stream Deck devices found.");
+        println!("If StreamController or another similar application is running, it has the device claimed. You'll need to shut it down before trying this program.");
+        return Ok(());
+    }
+
+    for (kind, serial) in devices {
+        println!("{:?}  serial {}  keys {}  dials {}", kind, serial, kind.key_count(), kind.encoder_count());
+    }
+
+    Ok(())
+}
+
+/// Print the lights that answer over mDNS, ready to paste into lights.conf.
+fn discover() -> Result<(), Box<dyn Error>> {
+    let period = Duration::from_secs(10);
+    eprintln!("decker: listening for Key Lights for {} s", period.as_secs());
+
+    let found = discovery::browse(period)?;
+    if found.is_empty() {
+        eprintln!("decker: none answered");
+    }
+    for light in &found {
+        print!("{}", discovery::section(light));
+    }
+
+    Ok(())
+}
+
+/// Give mDNS a moment to find lights configured by id, then connect and
+/// wait for each light's first answer, all of them in parallel.
+fn find(configs: Vec<LightConfig>) -> Lights {
+    let directory = Directory::start();
+    let ids: Vec<&str> = configs.iter().filter_map(|config| config.id.as_deref()).collect();
+    directory.wait(&ids, config::DISCOVERY);
+
+    let mut lights = Lights::connect(configs, &directory);
+    lights.settle(config::HTTP_TIMEOUT + Duration::from_millis(500));
+    lights
+}
+
+fn configured(config: Option<PathBuf>) -> Result<Config, Box<dyn Error>> {
+    let path = config
+        .or_else(config::default_path)
+        .ok_or("HOME is not set; give the lights file with --config")?;
+    config::load(&path)
+}
+
+/// Draw every surface to PNG without needing the hardware.
+fn preview(config: Option<PathBuf>, directory: &str) -> Result<(), Box<dyn Error>> {
+    use image::{GenericImage, RgbImage};
+
+    let config = configured(config)?;
+    std::fs::create_dir_all(directory)?;
+
+    let renderer = Renderer::new()?;
+    let lights = find(config.lights);
+    let modes = [Dial::Brightness, Dial::Temperature, Dial::Brightness, Dial::Temperature];
+
+    let status = media::Status { present: true, playing: true, muted: true };
+
+    let mut sheet = RgbImage::new(render::KEY * 4, render::KEY * 2);
+    for key in 0..8u32 {
+        let image = key_image(&renderer, &lights, &status, None, key as usize);
+        sheet.copy_from(&image.to_rgb8(), (key % 4) * render::KEY, (key / 4) * render::KEY)?;
+    }
+    sheet.save(format!("{}/keys.png", directory))?;
+
+    if !config.presets.is_empty() {
+        let mut sheet = RgbImage::new(render::KEY * 4, render::KEY * 2);
+        for key in 0..8u32 {
+            let image = key_image(&renderer, &lights, &status, Some(&config.presets), key as usize);
+            sheet.copy_from(&image.to_rgb8(), (key % 4) * render::KEY, (key / 4) * render::KEY)?;
+        }
+        sheet.save(format!("{}/presets.png", directory))?;
+    }
+
+    let mut strip = RgbImage::new(render::ZONE_WIDTH * 4, render::ZONE_HEIGHT);
+    for zone in 0..4usize {
+        let image = zone_image(&renderer, &lights, &modes, zone);
+        strip.copy_from(&image.to_rgb8(), zone as u32 * render::ZONE_WIDTH, 0)?;
+    }
+    strip.save(format!("{}/lcd.png", directory))?;
+
+    println!("wrote keys.png, lcd.png and any presets.png to {}", directory);
+    Ok(())
+}
+
+fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box<dyn Error>> {
+    let config = configured(config)?;
+    let presets = config.presets;
+
+    let mut hidapi = new_hidapi()?;
+    let (kind, serial) = list_devices(&hidapi)
+        .into_iter()
+        .find(|(kind, _)| matches!(kind, Kind::Plus | Kind::PlusXl))
+        .ok_or("No Stream Deck Plus found. Is another controller application still running?)")?;
+
+    let deck = StreamDeck::connect(&hidapi, kind, &serial)?;
+    deck.reset()?;
+    deck.set_brightness(brightness)?;
+
+    let renderer = Renderer::new()?;
+    let mut lights = find(config.lights);
+    let media = Media::start();
+    let mut modes = [Dial::Brightness; 4];
+
+    println!("decker: {:?} serial {}, firmware {}", kind, serial, deck.firmware_version()?);
+    for light in &lights.items {
+        println!(
+            "  {:<5} {:<21} {}",
+            light.name(),
+            light.address().unwrap_or_else(|| "not found".into()),
+            if light.online() { "ok" } else { "unreachable" }
+        );
+    }
+
+    let mut dirty = Dirty::all();
+    // Swiping the LCD swaps all eight keys for the presets until one is chosen.
+    let mut picking = false;
+    let mut generation = media.generation();
+    let mut idle = Idle::new(config::IDLE, Instant::now());
+    let mut dark = false;
+
+    let deck = std::sync::Arc::new(deck);
+    let reader = deck.get_reader();
+
+    // A problem with the deck is Unplugged if it is no longer attached.
+    let mut unplugged = |problem: Box<dyn Error>| -> Box<dyn Error> {
+        let attached = refresh_device_list(&mut hidapi).is_err()
+            || list_devices(&hidapi).iter().any(|(_, attached)| *attached == serial);
+        if attached {
+            problem
+        } else {
+            Box::new(Unplugged)
+        }
+    };
+
+    loop {
+        let updates = reader
+            .read(Some(Duration::from_millis(100)))
+            .map_err(|problem| unplugged(problem.into()))?;
+        for update in updates {
+            if verbose {
+                println!("{:?}", update);
+            }
+
+            if !idle.input(Instant::now()) {
+                continue;
+            }
+
+            match update {
+                DeviceStateUpdate::TouchScreenSwipe(..) if !presets.is_empty() => {
+                    picking = !picking;
+                    dirty.keys = [true; 8];
+                }
+
+                DeviceStateUpdate::ButtonDown(key) if picking => {
+                    if let Some(preset) = presets.get(key as usize) {
+                        lights.recall(preset);
+                        picking = false;
+                        dirty = Dirty::all();
+                    }
+                }
+
+                DeviceStateUpdate::ButtonDown(key) => match key {
+                    0 => media.send(Action::Previous),
+                    1 => media.send(Action::PlayPause),
+                    2 => media.send(Action::Next),
+                    3 => media.send(Action::ToggleMute),
+                    4..=6 => {
+                        let index = (key - 4) as usize;
+                        if let Some(light) = lights.items.get_mut(index) {
+                            light.toggle();
+                            dirty.keys[key as usize] = true;
+                            dirty.keys[7] = true;
+                            dirty.zones[index] = true;
+                            dirty.zones[3] = true;
+                        }
+                    }
+                    7 => {
+                        let wanted = !lights.any_on();
+                        lights.set_all(wanted);
+                        dirty = Dirty::all();
+                    }
+                    _ => {}
+                },
+
+                DeviceStateUpdate::EncoderTwist(dial, delta) => {
+                    let index = dial as usize;
+                    let delta = delta as i32;
+
+                    if index < 3 {
+                        if let Some(light) = lights.items.get_mut(index) {
+                            turn(light, modes[index], delta);
+                            dirty.keys[index + 4] = true;
+                            dirty.zones[index] = true;
+                            dirty.zones[3] = true;
+                        }
+                    } else if index == 3 {
+                        match modes[3] {
+                            Dial::Brightness => lights.nudge_all_brightness(delta * BRIGHTNESS_STEP),
+                            Dial::Temperature => lights.nudge_all_temperature(-delta * TEMPERATURE_STEP),
+                        }
+                        dirty = Dirty::all();
+                    }
+                }
+
+                DeviceStateUpdate::EncoderDown(dial) => {
+                    let index = dial as usize;
+                    if index == 3 {
+                        modes = [modes[3].flip(); 4];
+                        dirty.zones = [true; 4];
+                    } else if index < 3 {
+                        modes[index] = modes[index].flip();
+                        dirty.zones[index] = true;
+                    }
+                }
+
+                _ => {}
+            }
+        }
+
+        let latest = media.generation();
+        if latest != generation {
+            generation = latest;
+            dirty.keys[1] = true;
+            dirty.keys[3] = true;
+        }
+
+        for index in lights.poll() {
+            dirty.keys[index + 4] = true;
+            dirty.keys[7] = true;
+            dirty.zones[index] = true;
+            dirty.zones[3] = true;
+        }
+
+        idle.tick(Instant::now(), lights.any_on());
+        if idle.dark() != dark {
+            dark = idle.dark();
+            deck.set_brightness(if dark { 0 } else { brightness })
+                .map_err(|problem| unplugged(problem.into()))?;
+        }
+
+        paint(&deck, &renderer, &lights, &media, &modes, picking.then_some(&presets[..]), &mut dirty)
+            .map_err(|problem| unplugged(problem.into()))?;
+    }
+}
+
+fn turn(light: &mut lights::Light, mode: Dial, delta: i32) {
+    match mode {
+        Dial::Brightness => light.nudge_brightness(delta * BRIGHTNESS_STEP),
+        // Clockwise should read as more Kelvin, which is fewer mireds.
+        Dial::Temperature => light.nudge_temperature(-delta * TEMPERATURE_STEP),
+    }
+}
+
+fn paint(
+    deck: &StreamDeck,
+    renderer: &Renderer,
+    lights: &Lights,
+    media: &Media,
+    modes: &[Dial; 4],
+    picker: Option<&[Preset]>,
+    dirty: &mut Dirty,
+) -> Result<(), Box<dyn Error>> {
+    let status = media.status();
+    let mut flush = false;
+
+    for key in 0..8usize {
+        if !dirty.keys[key] {
+            continue;
+        }
+        dirty.keys[key] = false;
+        flush = true;
+
+        let image = key_image(renderer, lights, &status, picker, key);
+        deck.set_button_image(key as u8, image)?;
+    }
+
+    if flush {
+        deck.flush()?;
+    }
+
+    for zone in 0..4usize {
+        if !dirty.zones[zone] {
+            continue;
+        }
+        dirty.zones[zone] = false;
+
+        let image = zone_image(renderer, lights, modes, zone);
+        let x = (zone as u32 * render::ZONE_WIDTH) as u16;
+        deck.write_lcd(x, 0, &ImageRect::from_image(image)?)?;
+    }
+
+    Ok(())
+}
+
+/// Which keys and LCD zones need drawing again.
+struct Dirty {
+    keys: [bool; 8],
+    zones: [bool; 4],
+}
+
+impl Dirty {
+    fn all() -> Self {
+        Dirty { keys: [true; 8], zones: [true; 4] }
+    }
+}
+
+fn key_image(
+    renderer: &Renderer,
+    lights: &Lights,
+    status: &media::Status,
+    picker: Option<&[Preset]>,
+    key: usize,
+) -> DynamicImage {
+    if let Some(presets) = picker {
+        return match presets.get(key) {
+            Some(preset) => renderer.preset_key(preset),
+            None => renderer.empty_key(),
+        };
+    }
+
+    match key {
+        0..=3 => renderer.media_key(key as u8, status),
+        4..=6 => match lights.items.get(key - 4) {
+            Some(light) => renderer.light_key(light.name(), light.config.shape, &light.state, light.online()),
+            None => renderer.empty_key(),
+        },
+        _ => renderer.all_key(lights.any_on()),
+    }
+}
+
+fn zone_image(renderer: &Renderer, lights: &Lights, modes: &[Dial; 4], zone: usize) -> DynamicImage {
+    if zone == 3 {
+        let summary = lights::State {
+            on: lights.any_on(),
+            brightness: lights.mean_brightness(),
+            temperature: lights.mean_temperature(),
+        };
+        return renderer.zone("ALL", modes[3], summary, true);
+    }
+
+    match lights.items.get(zone) {
+        Some(light) => renderer.zone(light.name(), modes[zone], light.state, light.online()),
+        None => renderer.empty_zone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lights::{Light, State};
+
+    fn light() -> Light {
+        let state = State { on: true, brightness: 50, temperature: 200 };
+        let config = LightConfig { name: "Key".into(), id: None, host: Some("192.0.2.1".into()), shape: config::Shape::Panel };
+        Light::detached(config, state).0
+    }
+
+    #[test]
+    fn flip_alternates() {
+        assert!(Dial::Brightness.flip() == Dial::Temperature);
+        assert!(Dial::Temperature.flip() == Dial::Brightness);
+    }
+
+    #[test]
+    fn clockwise_is_brighter() {
+        let mut light = light();
+        turn(&mut light, Dial::Brightness, 3);
+        assert_eq!(light.state.brightness, 50 + 3 * BRIGHTNESS_STEP);
+        assert_eq!(light.state.temperature, 200);
+        turn(&mut light, Dial::Brightness, -5);
+        assert_eq!(light.state.brightness, 50 - 2 * BRIGHTNESS_STEP);
+    }
+
+    #[test]
+    fn clockwise_is_cooler() {
+        let mut light = light();
+        let before = config::kelvin(light.state.temperature);
+        turn(&mut light, Dial::Temperature, 2);
+        assert_eq!(light.state.temperature, 200 - 2 * TEMPERATURE_STEP);
+        assert!(config::kelvin(light.state.temperature) > before);
+        assert_eq!(light.state.brightness, 50);
+    }
+}

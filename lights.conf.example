@@ -1,0 +1,56 @@
+# Copy to ~/.config/decker/lights.conf. One section per light, in order left
+# to right across the deck, to a maximum of three lights. The option
+# `decker --discover` prints sections for the lights it can find.
+#
+#   id     MAC address; the light is found over mDNS wherever it is
+#   host   fixed address, used until (or unless) the light is found by id
+#   shape  panel (Key Light, MK.2) or air (Key Light Air); panel if left out
+#
+# Each light needs an id, a host, or both.
+
+[MK.2]
+host = 192.0.2.93
+
+[Key]
+id = 00:00:5E:00:53:01
+host = 192.0.2.97
+
+[Air]
+host = 192.0.2.81
+shape = air
+
+# Presets, at most eight. Swipe across the LCD to show them on the keys;
+# pressing one sets the lights and returns to the normal keys, swiping again
+# returns without changing anything. Each line sets one light by name:
+#
+#   off                      turn it off
+#   on, 40%, 213 or 4700K    turn it on; give brightness and/or temperature
+#                            (mireds like the Elgato API, or Kelvin) to set them
+#
+# A light a preset doesn't mention is left as it is. `colour` fills the
+# preset's key with blue, green, purple, grey, brown, red, orange, teal, or
+# #rrggbb.
+
+[preset Work]
+colour = blue
+MK.2 = 2% 310
+Key = 2% 310
+Air = 3% 295
+
+[preset Soft]
+colour = purple
+MK.2 = off
+Key = off
+Air = 14% 344
+
+[preset Read]
+colour = green
+MK.2 = 8% 265
+Key = 5% 300
+Air = 25% 192
+
+[preset Full]
+colour = grey
+MK.2 = 20% 229
+Key = 57% 192
+Air = 57% 192
