@@ -4,6 +4,10 @@ This is **decker**, a minor daemon program to control Elgato Key Lights and
 GNOME media playback from an Elgato [Stream Deck
 Plus](https://www.elgato.com/ww/en/p/stream-deck-plus) from Linux.
 
+<p align="center">
+<img src="images/Photo.jpg">
+</p>
+
 ## Layout
 
 ```
