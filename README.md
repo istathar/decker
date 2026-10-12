@@ -72,15 +72,20 @@ hardware attached.
 
 ## Device access
 
-In order for your user to be able to control the device you need a udev rule  installed to `/etc/udev/rules.d/`. 
-_udev/99-elgato-streamdeck.rules_ is provided for this purpose. Without it, the `hidraw` node is root-only. Replug the Stream Deck after installing this file.
+In order for your user to be able to control the device you need a udev rule
+installed to _/etc/udev/rules.d/udev/99-elgato-streamdeck.rules_ is provided
+for this purpose. Without it, the `hidraw` node is root-only. Replug the
+Stream Deck after installing this file.
 
 Note that only one program may hold a device like this, so make sure you quit
 any other Stream Deck controller programs you might have installed first.
 
 ## Running at login
 
-If you want the _decker_ daemon to run whenever the Stream Deck is attached, you can install the provided systemd user unit. The udev rule above starts it when the deck is plugged in, or when you log in with it attached, and stops it when the deck is unplugged.
+If you want the _decker_ daemon to run whenever the Stream Deck is attached,
+you can install the provided systemd user unit. The udev rule above starts it
+when the deck is plugged in, or when you log in with it attached, and stops it
+when the deck is unplugged.
 
 ```
 cargo build --release
