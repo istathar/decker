@@ -255,7 +255,8 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
     }
 
     let mut dirty = Dirty::all();
-    // Swiping the LCD swaps all eight keys for the presets until one is chosen.
+    // Swiping the LCD swaps the media keys for the presets until one is chosen.
+    // Waking the deck does too, unless media is playing; swipe to dismiss.
     let mut picking = false;
     let mut generation = media.generation();
     let mut idle = Idle::new(config::IDLE, Instant::now());
@@ -285,16 +286,22 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             }
 
             if !idle.input(Instant::now()) {
+                // Whatever the lights were left at is probably stale by now,
+                // so offer the presets, unless something is playing.
+                if !presets.is_empty() && !media.status().playing {
+                    picking = true;
+                    dirty.keys[..4].fill(true);
+                }
                 continue;
             }
 
             match update {
                 DeviceStateUpdate::TouchScreenSwipe(..) if !presets.is_empty() => {
                     picking = !picking;
-                    dirty.keys = [true; 8];
+                    dirty.keys[..4].fill(true);
                 }
 
-                DeviceStateUpdate::ButtonDown(key) if picking => {
+                DeviceStateUpdate::ButtonDown(key) if picking && key < 4 => {
                     if let Some(preset) = presets.get(key as usize) {
                         lights.recall(preset);
                         picking = false;
@@ -302,27 +309,19 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
                     }
                 }
 
+                // Using the light keys below the picker is as good as a choice.
+                DeviceStateUpdate::ButtonDown(key) if picking => {
+                    picking = false;
+                    dirty.keys[..4].fill(true);
+                    press(&mut lights, key, &mut dirty);
+                }
+
                 DeviceStateUpdate::ButtonDown(key) => match key {
                     0 => media.send(Action::Previous),
                     1 => media.send(Action::PlayPause),
                     2 => media.send(Action::Next),
                     3 => media.send(Action::ToggleMute),
-                    4..=6 => {
-                        let index = (key - 4) as usize;
-                        if let Some(light) = lights.items.get_mut(index) {
-                            light.toggle();
-                            dirty.keys[key as usize] = true;
-                            dirty.keys[7] = true;
-                            dirty.zones[index] = true;
-                            dirty.zones[3] = true;
-                        }
-                    }
-                    7 => {
-                        let wanted = !lights.any_on();
-                        lights.set_all(wanted);
-                        dirty = Dirty::all();
-                    }
-                    _ => {}
+                    _ => press(&mut lights, key, &mut dirty),
                 },
 
                 DeviceStateUpdate::EncoderTwist(dial, delta) => {
@@ -374,15 +373,39 @@ fn run(config: Option<PathBuf>, brightness: u8, verbose: bool) -> Result<(), Box
             dirty.zones[3] = true;
         }
 
-        idle.tick(Instant::now(), lights.any_on());
+        paint(&deck, &renderer, &lights, &media, &modes, picking.then_some(&presets[..]), &mut dirty)
+            .map_err(|problem| unplugged(problem.into()))?;
+
+        // After painting, so waking shows the new keys rather than a flash
+        // of the old ones.
+        idle.tick(Instant::now(), lights.any_on() || media.status().playing);
         if idle.dark() != dark {
             dark = idle.dark();
             deck.set_brightness(if dark { 0 } else { brightness })
                 .map_err(|problem| unplugged(problem.into()))?;
         }
+    }
+}
 
-        paint(&deck, &renderer, &lights, &media, &modes, picking.then_some(&presets[..]), &mut dirty)
-            .map_err(|problem| unplugged(problem.into()))?;
+/// The light keys along the bottom row.
+fn press(lights: &mut Lights, key: u8, dirty: &mut Dirty) {
+    match key {
+        4..=6 => {
+            let index = (key - 4) as usize;
+            if let Some(light) = lights.items.get_mut(index) {
+                light.toggle();
+                dirty.keys[key as usize] = true;
+                dirty.keys[7] = true;
+                dirty.zones[index] = true;
+                dirty.zones[3] = true;
+            }
+        }
+        7 => {
+            let wanted = !lights.any_on();
+            lights.set_all(wanted);
+            *dirty = Dirty::all();
+        }
+        _ => {}
     }
 }
 
@@ -454,11 +477,14 @@ fn key_image(
     picker: Option<&[Preset]>,
     key: usize,
 ) -> DynamicImage {
-    if let Some(presets) = picker {
-        return match presets.get(key) {
-            Some(preset) => renderer.preset_key(preset),
-            None => renderer.empty_key(),
-        };
+    match picker {
+        Some(presets) if key < 4 => {
+            return match presets.get(key) {
+                Some(preset) => renderer.preset_key(preset),
+                None => renderer.empty_key(),
+            };
+        }
+        _ => {}
     }
 
     match key {
