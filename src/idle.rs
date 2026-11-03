@@ -1,9 +1,9 @@
 use std::time::{Duration, Instant};
 
 /// Whether the deck's panel should be dark. It goes dark only once every
-/// light is off and nothing has been touched for a while; a light being on
-/// (whether controlled from this application or from anywhere else), keeps
-/// the deck lit.
+/// light is off, nothing is playing, and nothing has been touched for a
+/// while; a light being on or media playing (whether started from this
+/// application or from anywhere else), keeps the deck lit.
 pub struct Idle {
     timeout: Duration,
     last: Instant,
@@ -26,9 +26,10 @@ impl Idle {
         !std::mem::replace(&mut self.dark, false)
     }
 
-    /// Called on every pass of the event loop.
-    pub fn tick(&mut self, now: Instant, any_on: bool) {
-        if any_on {
+    /// Called on every pass of the event loop. Judged to be "busy" if any
+    /// light is on or media is playing.
+    pub fn tick(&mut self, now: Instant, busy: bool) {
+        if busy {
             self.last = now;
             self.dark = false;
         } else if now.duration_since(self.last) >= self.timeout {
@@ -58,7 +59,7 @@ mod tests {
     }
 
     #[test]
-    fn stays_lit_while_any_light_is_on() {
+    fn stays_lit_while_busy() {
         let start = Instant::now();
         let mut idle = Idle::new(TIMEOUT, start);
         idle.tick(later(start, 3600), true);

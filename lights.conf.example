@@ -19,8 +19,8 @@ host = 192.0.2.97
 host = 192.0.2.81
 shape = air
 
-# Presets, at most eight. Swipe across the LCD to show them on the keys;
-# pressing one sets the lights and returns to the normal keys, swiping again
+# Presets, at most four. Swipe across the LCD (or wake the deck) to show them
+# in place of the media keys; pressing one sets the lights, swiping again
 # returns without changing anything. Each line sets one light by name:
 #
 #   off                      turn it off

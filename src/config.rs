@@ -24,8 +24,8 @@ pub enum Shape {
 /// Lights go on keys 4-6 and dials 0-2.
 pub const MAX_LIGHTS: usize = 3;
 
-/// Presets fill all eight keys when the picker is up.
-pub const MAX_PRESETS: usize = 8;
+/// Presets take the top row of keys when the picker is up.
+pub const MAX_PRESETS: usize = 4;
 
 /// Everything in lights.conf.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,7 +118,7 @@ pub fn load(path: &Path) -> Result<Config, Box<dyn Error>> {
 /// shape = panel
 /// ```
 ///
-/// and up to eight `[preset Name]` sections, each setting lights by name:
+/// and up to four `[preset Name]` sections, each setting lights by name:
 ///
 /// ```text
 /// [preset Soft]
@@ -612,10 +612,10 @@ mod tests {
         fails(&format!("{}[preset A]\nKey\n", LIGHTS), "line 8: expected setting = value");
         fails(&format!("{}[preset A]\nKey =\n", LIGHTS), "line 8: Key has no value");
 
-        let nine: String = (1..=9).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
-        fails(&format!("{}{}", LIGHTS, nine), "9 presets configured, but there is only room for 8");
-        let eight: String = (1..=8).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
-        assert_eq!(parse(&format!("{}{}", LIGHTS, eight)).unwrap().presets.len(), 8);
+        let five: String = (1..=5).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
+        fails(&format!("{}{}", LIGHTS, five), "5 presets configured, but there is only room for 4");
+        let four: String = (1..=4).map(|n| format!("[preset P{}]\nKey = on\n", n)).collect();
+        assert_eq!(parse(&format!("{}{}", LIGHTS, four)).unwrap().presets.len(), 4);
     }
 
     #[test]
